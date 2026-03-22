@@ -10,7 +10,10 @@ RUN useradd --create-home appuser
 
 WORKDIR /app
 
-# Install Python dependencies
+# Install CPU-only PyTorch first (skip CUDA, saves ~4GB)
+RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# Install remaining Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
