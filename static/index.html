@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Karaoke Maker</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0f0f0f;
+            color: #fff;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 560px;
+            padding: 2rem;
+        }
+
+        h1 {
+            font-size: 2rem;
+            margin-bottom: 0.5rem;
+            text-align: center;
+        }
+
+        .subtitle {
+            color: #888;
+            text-align: center;
+            margin-bottom: 2.5rem;
+            font-size: 0.95rem;
+        }
+
+        .input-group {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 1.5rem;
+        }
+
+        input {
+            flex: 1;
+            padding: 0.9rem 1rem;
+            border: 2px solid #333;
+            border-radius: 10px;
+            background: #1a1a1a;
+            color: #fff;
+            font-size: 1rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        input:focus {
+            border-color: #7c3aed;
+        }
+
+        input::placeholder {
+            color: #555;
+        }
+
+        button {
+            padding: 0.9rem 1.5rem;
+            background: #7c3aed;
+            color: #fff;
+            border: none;
+            border-radius: 10px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+            white-space: nowrap;
+        }
+
+        button:hover:not(:disabled) {
+            background: #6d28d9;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .status {
+            text-align: center;
+            padding: 1rem;
+            display: none;
+        }
+
+        .status.visible {
+            display: block;
+        }
+
+        .status .message {
+            color: #aaa;
+            font-size: 0.95rem;
+        }
+
+        .status .error {
+            color: #ef4444;
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #333;
+            border-top-color: #7c3aed;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            vertical-align: middle;
+            margin-right: 0.5rem;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .player {
+            display: none;
+            margin-top: 1rem;
+        }
+
+        .player.visible {
+            display: block;
+        }
+
+        .player-label {
+            color: #aaa;
+            font-size: 0.85rem;
+            margin-bottom: 0.5rem;
+            text-align: center;
+        }
+
+        audio {
+            width: 100%;
+            border-radius: 10px;
+            outline: none;
+        }
+
+        .download-link {
+            display: block;
+            text-align: center;
+            margin-top: 0.75rem;
+            color: #7c3aed;
+            text-decoration: none;
+            font-size: 0.9rem;
+        }
+
+        .download-link:hover {
+            text-decoration: underline;
+        }
+
+        .actions {
+            text-align: center;
+            margin-top: 1.5rem;
+            display: none;
+        }
+
+        .actions.visible {
+            display: block;
+        }
+
+        .actions button {
+            padding: 0.6rem 1.2rem;
+            font-size: 0.9rem;
+            background: #333;
+        }
+
+        .actions button:hover:not(:disabled) {
+            background: #444;
+        }
+
+        .sr-only {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            padding: 0;
+            margin: -1px;
+            overflow: hidden;
+            clip: rect(0, 0, 0, 0);
+            white-space: nowrap;
+            border: 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container" role="main">
+        <h1>Karaoke Maker</h1>
+        <p class="subtitle">Paste a YouTube link, get the karaoke version</p>
+
+        <form class="input-group" id="form" onsubmit="return handleSubmit(event)">
+            <label for="urlInput" class="sr-only">YouTube URL</label>
+            <input type="url" id="urlInput" placeholder="https://youtube.com/watch?v=..." autofocus
+                   aria-label="YouTube URL" required>
+            <button type="submit" id="goBtn">Go</button>
+        </form>
+
+        <div class="status" id="status" role="status" aria-live="polite">
+            <p class="message" id="statusMsg"></p>
+        </div>
+
+        <div class="player" id="player">
+            <p class="player-label">Karaoke Version</p>
+            <audio controls id="audio" aria-label="Karaoke audio player"></audio>
+            <a class="download-link" id="downloadLink" href="#" download>Download karaoke track</a>
+        </div>
+
+        <div class="actions" id="actions">
+            <button type="button" onclick="resetForm()">Process another song</button>
+        </div>
+    </div>
+
+    <script>
+        const urlInput = document.getElementById('urlInput');
+        const goBtn = document.getElementById('goBtn');
+        const status = document.getElementById('status');
+        const statusMsg = document.getElementById('statusMsg');
+        const player = document.getElementById('player');
+        const audio = document.getElementById('audio');
+        const downloadLink = document.getElementById('downloadLink');
+        const actions = document.getElementById('actions');
+
+        let isProcessing = false;
+        let abortController = null;
+
+        function handleSubmit(e) {
+            e.preventDefault();
+            if (!isProcessing) process();
+            return false;
+        }
+
+        function resetForm() {
+            urlInput.value = '';
+            urlInput.disabled = false;
+            goBtn.disabled = false;
+            player.classList.remove('visible');
+            actions.classList.remove('visible');
+            status.classList.remove('visible');
+            audio.src = '';
+            urlInput.focus();
+        }
+
+        async function process() {
+            const url = urlInput.value.trim();
+            if (!url) return;
+
+            isProcessing = true;
+            abortController = new AbortController();
+
+            // Disable input
+            goBtn.disabled = true;
+            urlInput.disabled = true;
+            player.classList.remove('visible');
+            actions.classList.remove('visible');
+
+            // Show loading
+            status.classList.add('visible');
+            statusMsg.className = 'message';
+            statusMsg.textContent = 'Downloading audio...';
+
+            // Update message after a delay
+            const msgTimer = setTimeout(() => {
+                if (isProcessing) {
+                    statusMsg.textContent = 'Removing vocals... this takes 1-3 minutes';
+                }
+            }, 5000);
+
+            try {
+                const res = await fetch('/api/process', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url }),
+                    signal: abortController.signal,
+                });
+
+                clearTimeout(msgTimer);
+
+                let data;
+                try {
+                    data = await res.json();
+                } catch {
+                    throw new Error('Server returned an invalid response. Please try again.');
+                }
+
+                if (!res.ok) {
+                    throw new Error(data.detail || 'Something went wrong');
+                }
+
+                // Show player
+                statusMsg.textContent = 'Done!';
+                audio.src = data.audio_url;
+                downloadLink.href = data.audio_url;
+                player.classList.add('visible');
+                actions.classList.add('visible');
+
+            } catch (err) {
+                clearTimeout(msgTimer);
+                if (err.name === 'AbortError') return;
+                statusMsg.className = 'message error';
+                statusMsg.textContent = err.message;
+                goBtn.disabled = false;
+                urlInput.disabled = false;
+            } finally {
+                isProcessing = false;
+                abortController = null;
+            }
+        }
+    </script>
+</body>
+</html>
