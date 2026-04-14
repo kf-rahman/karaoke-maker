@@ -4,7 +4,14 @@ import uuid
 import shutil
 import subprocess
 import asyncio
+import logging
 from pathlib import Path
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
@@ -94,6 +101,8 @@ async def process_video(req: ProcessRequest, request: Request):
 
     input_file = job_dir / "input.wav"
 
+    logging.info("[%s] New job started for URL: %s", job_id, url)
+
     try:
         # Acquire semaphore so we don't run too many heavy jobs at once
         try:
@@ -107,6 +116,7 @@ async def process_video(req: ProcessRequest, request: Request):
 
         try:
             # Step 0: Check video duration before downloading
+            logging.info("[%s] Probing video duration...", job_id)
             probe_result = await asyncio.to_thread(
                 subprocess.run,
                 [
@@ -124,6 +134,7 @@ async def process_video(req: ProcessRequest, request: Request):
                 raw_duration = probe_result.stdout.strip()
                 try:
                     duration = float(raw_duration)
+                    logging.info("[%s] Video duration: %ds", job_id, int(duration))
                     if duration > MAX_DURATION_SECONDS:
                         raise HTTPException(
                             status_code=400,
@@ -133,6 +144,7 @@ async def process_video(req: ProcessRequest, request: Request):
                     pass  # duration unavailable – proceed and let filesize limit catch it
 
             # Step 1: Download audio from YouTube
+            logging.info("[%s] Downloading audio...", job_id)
             dl_result = await asyncio.to_thread(
                 subprocess.run,
                 [
@@ -156,6 +168,7 @@ async def process_video(req: ProcessRequest, request: Request):
                 # Sanitize stderr – never leak server paths
                 stderr_safe = dl_result.stderr[:200] if dl_result.stderr else "Unknown error"
                 stderr_safe = stderr_safe.replace(str(WORK_DIR), "[workdir]")
+                logging.error("[%s] Download failed: %s", job_id, stderr_safe)
                 raise HTTPException(
                     status_code=400,
                     detail=f"Failed to download audio: {stderr_safe}",
@@ -166,12 +179,16 @@ async def process_video(req: ProcessRequest, request: Request):
             if not actual_files:
                 raise HTTPException(status_code=500, detail="Download succeeded but file not found")
             actual_input = actual_files[0]
+            logging.info("[%s] Download complete: %s (%.1fMB)", job_id, actual_input.name, actual_input.stat().st_size / 1e6)
 
             # Step 2: Run Demucs to separate vocals
+            logging.info("[%s] Starting vocal separation (this takes 1-5 min on CPU)...", job_id)
+            t0 = time.time()
             demucs_result = await asyncio.to_thread(
                 subprocess.run,
                 [
                     "python", "-m", "demucs",
+                    "-n", "mdx_extra_q",
                     "--two-stems", "vocals",
                     "-o", str(job_dir / "output"),
                     "--mp3",
@@ -181,17 +198,22 @@ async def process_video(req: ProcessRequest, request: Request):
                 text=True,
                 timeout=600,
             )
+            elapsed = time.time() - t0
 
             if demucs_result.returncode != 0:
-                stderr_safe = (demucs_result.stderr[:200] if demucs_result.stderr else "Unknown error")
-                stderr_safe = stderr_safe.replace(str(WORK_DIR), "[workdir]")
+                combined = (demucs_result.stderr or "") + (demucs_result.stdout or "")
+                combined = combined[:400] if combined else "Unknown error"
+                combined = combined.replace(str(WORK_DIR), "[workdir]")
+                logging.error("[%s] Demucs failed after %.1fs: %s", job_id, elapsed, combined)
                 raise HTTPException(
                     status_code=500,
-                    detail=f"Vocal separation failed: {stderr_safe}",
+                    detail=f"Vocal separation failed: {combined}",
                 )
 
+            logging.info("[%s] Vocal separation complete in %.1fs", job_id, elapsed)
+
             # Step 3: Find the instrumental (no_vocals) track
-            output_dir = job_dir / "output" / "htdemucs"
+            output_dir = job_dir / "output" / "mdx_extra_q"
             if not output_dir.exists():
                 raise HTTPException(status_code=500, detail="Vocal separation completed but output directory not found")
 
@@ -221,6 +243,7 @@ async def process_video(req: ProcessRequest, request: Request):
         # Cleanup job directory
         shutil.rmtree(job_dir, ignore_errors=True)
 
+        logging.info("[%s] Job complete. Serving: %s", job_id, serve_name)
         return JSONResponse({
             "status": "success",
             "audio_url": f"/api/audio/{serve_name}",
@@ -230,9 +253,11 @@ async def process_video(req: ProcessRequest, request: Request):
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
     except subprocess.TimeoutExpired:
+        logging.error("[%s] Job timed out", job_id)
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(status_code=504, detail="Processing timed out. Try a shorter song.")
     except Exception:
+        logging.exception("[%s] Unexpected error", job_id)
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail="An internal error occurred.")
 

@@ -1,41 +1,30 @@
 FROM python:3.11-slim
 
-# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
 RUN useradd --create-home appuser
 
 WORKDIR /app
 
-# Install CPU-only PyTorch (small footprint, no CUDA)
-RUN pip install --no-cache-dir \
-    torch==2.2.0+cpu \
-    torchaudio==2.2.0+cpu \
-    --index-url https://download.pytorch.org/whl/cpu
+# Regular PyTorch (has ARM64 support, unlike +cpu wheels)
+RUN pip install --no-cache-dir torch==2.2.0 torchaudio==2.2.0
 
-# Install demucs and its deps separately (pin numpy<2 for demucs 4.0.1 compatibility)
 RUN pip install --no-cache-dir "numpy<2" demucs==4.0.1
 
-# Install web framework
 RUN pip install --no-cache-dir \
     fastapi==0.115.0 \
     uvicorn==0.30.6 \
     pydantic==2.9.2 \
     yt-dlp
 
-# Copy application
 COPY . .
 
-# Create work directory with correct permissions
 RUN mkdir -p /tmp/karaoke_work && chown appuser:appuser /tmp/karaoke_work
 
-# Switch to non-root user and pre-download the Demucs model so it's baked into the image
 USER appuser
 RUN python -c "from demucs.pretrained import get_model; get_model('mdx_extra_q')"
 
 EXPOSE 8000
-
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-keep-alive", "620"]
