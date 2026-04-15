@@ -52,6 +52,20 @@ _YT_RE = re.compile(
     r"^https?://(www\.)?(youtube\.com/watch\?v=[\w\-]{11}|youtu\.be/[\w\-]{11}|youtube\.com/shorts/[\w\-]{11})"
 )
 
+# Video ID extraction
+_YT_ID_RE = re.compile(r"(?:v=|youtu\.be/|shorts/)([\w\-]{11})")
+
+# Piped instance to use as a proxy (avoids YouTube bot detection on server IPs)
+PIPED_INSTANCE = "https://piped.video"
+
+
+def _to_piped_url(youtube_url: str) -> str:
+    """Convert a YouTube URL to a Piped URL for bot-detection bypass."""
+    m = _YT_ID_RE.search(youtube_url)
+    if not m:
+        return youtube_url
+    return f"{PIPED_INSTANCE}/watch?v={m.group(1)}"
+
 
 class ProcessRequest(BaseModel):
     url: str
@@ -101,7 +115,8 @@ async def process_video(req: ProcessRequest, request: Request):
 
     input_file = job_dir / "input.wav"
 
-    logging.info("[%s] New job started for URL: %s", job_id, url)
+    piped_url = _to_piped_url(url)
+    logging.info("[%s] New job started. Piped URL: %s", job_id, piped_url)
 
     try:
         # Acquire semaphore so we don't run too many heavy jobs at once
@@ -127,8 +142,7 @@ async def process_video(req: ProcessRequest, request: Request):
                     "--no-playlist",
                     "--print", "duration",
                     "--skip-download",
-                    "--extractor-args", "youtube:player_client=ios",
-                    url,
+                    piped_url,
                 ],
                 capture_output=True,
                 text=True,
@@ -160,9 +174,8 @@ async def process_video(req: ProcessRequest, request: Request):
                     "--no-exec",
                     "--no-batch-file",
                     "--no-config",
-                    "--extractor-args", "youtube:player_client=ios",
                     "-o", str(input_file),
-                    "--", url,
+                    "--", piped_url,
                 ],
                 capture_output=True,
                 text=True,
