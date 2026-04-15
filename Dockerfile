@@ -36,6 +36,6 @@ RUN mkdir -p /tmp/karaoke_work && chown appuser:appuser /tmp/karaoke_work
 USER appuser
 RUN python -c "from demucs.pretrained import get_model; get_model('mdx_extra_q')"
 
-EXPOSE 8000
+EXPOSE 7860
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-keep-alive", "620"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860", "--timeout-keep-alive", "620"]

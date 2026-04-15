@@ -1,3 +1,12 @@
+---
+title: Karaoke Maker
+emoji: 🎤
+colorFrom: purple
+colorTo: indigo
+sdk: docker
+pinned: false
+---
+
 # Karaoke Maker
 
 Paste a YouTube link, get back an instrumental (vocals-removed) version you can sing over.
@@ -33,25 +42,12 @@ Then open [http://localhost:8000](http://localhost:8000).
 
 ---
 
-## Deploying to Railway
-
-The app is pre-configured for [Railway](https://railway.app) via `railway.json`.
-
-1. Push this repo to GitHub
-2. Create a new Railway project → **Deploy from GitHub repo**
-3. Railway will auto-detect `railway.json` and build with `Dockerfile`
-4. Set the Railway instance to at least **4GB RAM** (Demucs requires it)
-
-No environment variables are required.
-
----
-
 ## Limitations
 
 - YouTube only (no other sources)
 - Max song length: 10 minutes
 - Rate limit: 3 requests per IP per minute
-- Max 2 songs processing simultaneously (prevents OOM)
+- Max 1 song processing at a time (CPU constraint)
 - Vocal separation quality varies — works best on songs with clear vocal/instrumental separation
 
 ---
@@ -62,7 +58,7 @@ No environment variables are required.
 |---|---|
 | Backend | FastAPI + uvicorn |
 | Audio download | yt-dlp |
-| Vocal separation | Demucs `htdemucs` model |
-| ML framework | PyTorch (CPU-only in prod) |
+| Vocal separation | Demucs `mdx_extra_q` model |
+| ML framework | PyTorch (CPU-only) |
 | Frontend | Vanilla HTML/CSS/JS |
-| Deployment | Docker + Railway |
+| Hosting | Hugging Face Spaces |
