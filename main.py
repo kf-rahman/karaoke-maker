@@ -34,7 +34,7 @@ RATE_LIMIT_MAX = 3       # max requests per window
 # ---------------------------------------------------------------------------
 # Concurrency guard – avoid OOM from many Demucs jobs running at once
 # ---------------------------------------------------------------------------
-MAX_CONCURRENT_JOBS = 2
+MAX_CONCURRENT_JOBS = 1  # CPU can only usefully run one Demucs job at a time
 _job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
 # Serve frontend
@@ -106,13 +106,16 @@ async def process_video(req: ProcessRequest, request: Request):
     try:
         # Acquire semaphore so we don't run too many heavy jobs at once
         try:
-            await asyncio.wait_for(_job_semaphore.acquire(), timeout=10)
+            logging.info("[%s] Waiting for processing slot...", job_id)
+            await asyncio.wait_for(_job_semaphore.acquire(), timeout=900)
         except asyncio.TimeoutError:
             shutil.rmtree(job_dir, ignore_errors=True)
             raise HTTPException(
                 status_code=503,
-                detail="Server is busy processing other songs. Please try again shortly.",
+                detail="Server is busy. Please try again in a few minutes.",
             )
+
+        song_duration: float | None = None
 
         try:
             # Step 0: Check video duration before downloading
@@ -133,15 +136,15 @@ async def process_video(req: ProcessRequest, request: Request):
             if probe_result.returncode == 0:
                 raw_duration = probe_result.stdout.strip()
                 try:
-                    duration = float(raw_duration)
-                    logging.info("[%s] Video duration: %ds", job_id, int(duration))
-                    if duration > MAX_DURATION_SECONDS:
+                    song_duration = float(raw_duration)
+                    logging.info("[%s] Video duration: %ds", job_id, int(song_duration))
+                    if song_duration > MAX_DURATION_SECONDS:
                         raise HTTPException(
                             status_code=400,
-                            detail=f"Video is too long ({int(duration)}s). Maximum is {MAX_DURATION_SECONDS // 60} minutes.",
+                            detail=f"Video is too long ({int(song_duration)}s). Maximum is {MAX_DURATION_SECONDS // 60} minutes.",
                         )
                 except ValueError:
-                    pass  # duration unavailable – proceed and let filesize limit catch it
+                    pass  # duration unavailable – fall back to fixed timeout
 
             # Step 1: Download audio from YouTube
             logging.info("[%s] Downloading audio...", job_id)
@@ -182,7 +185,10 @@ async def process_video(req: ProcessRequest, request: Request):
             logging.info("[%s] Download complete: %s (%.1fMB)", job_id, actual_input.name, actual_input.stat().st_size / 1e6)
 
             # Step 2: Run Demucs to separate vocals
-            logging.info("[%s] Starting vocal separation (this takes 1-5 min on CPU)...", job_id)
+            # Timeout = 3x song duration (floor 5 min, ceiling 20 min).
+            # Falls back to 15 min if duration probe failed.
+            demucs_timeout = int(max(300, min(song_duration * 3, 1200))) if song_duration else 900
+            logging.info("[%s] Starting vocal separation (timeout: %ds)...", job_id, demucs_timeout)
             t0 = time.time()
             demucs_result = await asyncio.to_thread(
                 subprocess.run,
@@ -196,7 +202,7 @@ async def process_video(req: ProcessRequest, request: Request):
                 ],
                 capture_output=True,
                 text=True,
-                timeout=600,
+                timeout=demucs_timeout,
             )
             elapsed = time.time() - t0
 
