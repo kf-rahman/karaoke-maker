@@ -1,11 +1,10 @@
+import os
 import re
 import uuid
-import json
 import shutil
 import subprocess
 import asyncio
 import logging
-import urllib.request
 from pathlib import Path
 
 logging.basicConfig(
@@ -23,6 +22,19 @@ import time
 from collections import defaultdict
 
 app = FastAPI(docs_url=None, redoc_url=None)
+
+# ---------------------------------------------------------------------------
+# YouTube cookies — loaded from YOUTUBE_COOKIES env var (HF Space secret).
+# Written to a temp file once at startup so yt-dlp can use them.
+# ---------------------------------------------------------------------------
+COOKIES_FILE = Path("/tmp/yt_cookies.txt")
+
+_cookies_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
+if _cookies_content:
+    COOKIES_FILE.write_text(_cookies_content)
+    logging.info("YouTube cookies loaded from environment.")
+else:
+    logging.warning("YOUTUBE_COOKIES not set — downloads may fail on server IPs.")
 
 # ---------------------------------------------------------------------------
 # Rate limiting (simple in-memory, per-IP)
@@ -47,54 +59,18 @@ WORK_DIR.mkdir(exist_ok=True)
 # Maximum allowed audio duration in seconds (10 minutes)
 MAX_DURATION_SECONDS = 600
 
-# Max download size in bytes (50MB)
-MAX_FILE_SIZE = 50 * 1024 * 1024
-
-# YouTube URL + video ID patterns
+# YouTube URL pattern
 _YT_RE = re.compile(
     r"^https?://(www\.)?(youtube\.com/watch\?v=[\w\-]{11}|youtu\.be/[\w\-]{11}|youtube\.com/shorts/[\w\-]{11})"
 )
-_YT_ID_RE = re.compile(r"(?:v=|youtu\.be/|shorts/)([\w\-]{11})")
-
-# Piped API instances (tried in order, falls back if one is down)
-_PIPED_INSTANCES = [
-    "https://pipedapi.kavin.rocks",
-    "https://pipedapi.adminforge.de",
-    "https://piped-api.privacy.com.de",
-]
 
 
-def _get_piped_audio(video_id: str) -> tuple[str, float | None]:
-    """
-    Fetch audio stream URL and duration from Piped API.
-    Tries multiple instances and returns the first success.
-    Returns (stream_url, duration_seconds).
-    """
-    last_err: Exception | None = None
-    for instance in _PIPED_INSTANCES:
-        try:
-            req = urllib.request.Request(
-                f"{instance}/streams/{video_id}",
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read())
-
-            duration = float(data["duration"]) if data.get("duration") else None
-            streams = data.get("audioStreams", [])
-            if not streams:
-                raise ValueError("No audio streams returned")
-
-            # Pick highest-bitrate stream
-            best = max(streams, key=lambda s: s.get("bitrate", 0))
-            return best["url"], duration
-
-        except Exception as e:
-            logging.warning("Piped instance %s failed: %s", instance, e)
-            last_err = e
-            continue
-
-    raise RuntimeError(f"All Piped instances failed. Last error: {last_err}")
+def _yt_dlp_base_args() -> list[str]:
+    """Common yt-dlp flags used in every call."""
+    args = ["yt-dlp", "--no-playlist", "--js-runtimes", "node"]
+    if COOKIES_FILE.exists():
+        args += ["--cookies", str(COOKIES_FILE)]
+    return args
 
 
 class ProcessRequest(BaseModel):
@@ -138,17 +114,12 @@ async def process_video(req: ProcessRequest, request: Request):
     _check_rate_limit(client_ip)
 
     url = req.url
-    video_id_match = _YT_ID_RE.search(url)
-    if not video_id_match:
-        raise HTTPException(status_code=400, detail="Could not extract video ID from URL")
-    video_id = video_id_match.group(1)
-
     job_id = str(uuid.uuid4())[:8]
     job_dir = WORK_DIR / job_id
     job_dir.mkdir(exist_ok=True)
     input_file = job_dir / "input.wav"
 
-    logging.info("[%s] New job — video ID: %s", job_id, video_id)
+    logging.info("[%s] New job: %s", job_id, url)
 
     try:
         try:
@@ -161,67 +132,58 @@ async def process_video(req: ProcessRequest, request: Request):
                 detail="Server is busy. Please try again in a few minutes.",
             )
 
+        song_duration: float | None = None
+
         try:
-            # Step 1: Get audio stream URL from Piped API
-            logging.info("[%s] Fetching stream URL from Piped API...", job_id)
-            try:
-                stream_url, song_duration = await asyncio.to_thread(
-                    _get_piped_audio, video_id
-                )
-            except Exception as e:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Could not fetch audio stream: {e}",
-                )
-
-            logging.info(
-                "[%s] Got stream URL. Duration: %s",
-                job_id,
-                f"{int(song_duration)}s" if song_duration else "unknown",
-            )
-
-            if song_duration and song_duration > MAX_DURATION_SECONDS:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Video is too long ({int(song_duration)}s). Maximum is {MAX_DURATION_SECONDS // 60} minutes.",
-                )
-
-            # Step 2: Download audio via ffmpeg (handles all formats, converts to WAV)
-            logging.info("[%s] Downloading audio...", job_id)
-            dl_result = await asyncio.to_thread(
+            # Step 0: Probe duration
+            logging.info("[%s] Probing video duration...", job_id)
+            probe = await asyncio.to_thread(
                 subprocess.run,
-                [
-                    "ffmpeg", "-y",
-                    "-i", stream_url,
-                    "-vn",                  # drop video
-                    "-acodec", "pcm_s16le", # convert to WAV
-                    "-ar", "44100",         # standard sample rate
-                    str(input_file),
+                _yt_dlp_base_args() + ["--print", "duration", "--skip-download", url],
+                capture_output=True, text=True, timeout=30,
+            )
+            if probe.returncode == 0:
+                try:
+                    song_duration = float(probe.stdout.strip())
+                    logging.info("[%s] Duration: %ds", job_id, int(song_duration))
+                    if song_duration > MAX_DURATION_SECONDS:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Video is too long ({int(song_duration)}s). Maximum is {MAX_DURATION_SECONDS // 60} minutes.",
+                        )
+                except ValueError:
+                    pass  # duration unavailable – fall back to fixed timeout
+
+            # Step 1: Download audio
+            logging.info("[%s] Downloading audio...", job_id)
+            dl = await asyncio.to_thread(
+                subprocess.run,
+                _yt_dlp_base_args() + [
+                    "-x", "--audio-format", "wav",
+                    "--max-filesize", "50M",
+                    "--no-exec", "--no-batch-file", "--no-config",
+                    "-o", str(input_file),
+                    "--", url,
                 ],
-                capture_output=True,
-                text=True,
-                timeout=120,
+                capture_output=True, text=True, timeout=120,
             )
 
-            if dl_result.returncode != 0:
-                err = (dl_result.stderr or "")[:200]
-                logging.error("[%s] ffmpeg download failed: %s", job_id, err)
-                raise HTTPException(status_code=400, detail="Failed to download audio.")
+            if dl.returncode != 0:
+                err = (dl.stderr or "")[:200].replace(str(WORK_DIR), "[workdir]")
+                logging.error("[%s] Download failed: %s", job_id, err)
+                raise HTTPException(status_code=400, detail=f"Failed to download audio: {err}")
 
-            if input_file.stat().st_size > MAX_FILE_SIZE:
-                raise HTTPException(status_code=400, detail="Audio file too large (max 50MB).")
+            actual_files = list(job_dir.glob("input*"))
+            if not actual_files:
+                raise HTTPException(status_code=500, detail="Download succeeded but file not found")
+            actual_input = actual_files[0]
+            logging.info("[%s] Download complete (%.1fMB)", job_id, actual_input.stat().st_size / 1e6)
 
-            logging.info(
-                "[%s] Download complete (%.1fMB)",
-                job_id,
-                input_file.stat().st_size / 1e6,
-            )
-
-            # Step 3: Run Demucs vocal separation
+            # Step 2: Vocal separation
             demucs_timeout = int(max(300, min(song_duration * 3, 1200))) if song_duration else 900
             logging.info("[%s] Starting vocal separation (timeout: %ds)...", job_id, demucs_timeout)
             t0 = time.time()
-            demucs_result = await asyncio.to_thread(
+            demucs = await asyncio.to_thread(
                 subprocess.run,
                 [
                     "python", "-m", "demucs",
@@ -229,23 +191,21 @@ async def process_video(req: ProcessRequest, request: Request):
                     "--two-stems", "vocals",
                     "-o", str(job_dir / "output"),
                     "--mp3",
-                    str(input_file),
+                    str(actual_input),
                 ],
-                capture_output=True,
-                text=True,
-                timeout=demucs_timeout,
+                capture_output=True, text=True, timeout=demucs_timeout,
             )
             elapsed = time.time() - t0
 
-            if demucs_result.returncode != 0:
-                combined = ((demucs_result.stderr or "") + (demucs_result.stdout or ""))[:400]
+            if demucs.returncode != 0:
+                combined = ((demucs.stderr or "") + (demucs.stdout or ""))[:400]
                 combined = combined.replace(str(WORK_DIR), "[workdir]")
                 logging.error("[%s] Demucs failed after %.1fs: %s", job_id, elapsed, combined)
                 raise HTTPException(status_code=500, detail=f"Vocal separation failed: {combined}")
 
             logging.info("[%s] Vocal separation complete in %.1fs", job_id, elapsed)
 
-            # Step 4: Find the instrumental (no_vocals) track
+            # Step 3: Find output file
             output_dir = job_dir / "output" / "mdx_extra_q"
             if not output_dir.exists():
                 raise HTTPException(status_code=500, detail="Output directory not found")
