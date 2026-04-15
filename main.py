@@ -1,10 +1,11 @@
-import os
 import re
 import uuid
+import json
 import shutil
 import subprocess
 import asyncio
 import logging
+import urllib.request
 from pathlib import Path
 
 logging.basicConfig(
@@ -17,24 +18,23 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, field_validator
-from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+import time
+from collections import defaultdict
 
 app = FastAPI(docs_url=None, redoc_url=None)
 
 # ---------------------------------------------------------------------------
 # Rate limiting (simple in-memory, per-IP)
 # ---------------------------------------------------------------------------
-import time
-from collections import defaultdict
-
 _rate_limit_store: dict[str, list[float]] = defaultdict(list)
 RATE_LIMIT_WINDOW = 60  # seconds
 RATE_LIMIT_MAX = 3       # max requests per window
 
 # ---------------------------------------------------------------------------
-# Concurrency guard – avoid OOM from many Demucs jobs running at once
+# Concurrency guard – one Demucs job at a time on CPU
 # ---------------------------------------------------------------------------
-MAX_CONCURRENT_JOBS = 1  # CPU can only usefully run one Demucs job at a time
+MAX_CONCURRENT_JOBS = 1
 _job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
 # Serve frontend
@@ -47,24 +47,54 @@ WORK_DIR.mkdir(exist_ok=True)
 # Maximum allowed audio duration in seconds (10 minutes)
 MAX_DURATION_SECONDS = 600
 
-# YouTube URL pattern
+# Max download size in bytes (50MB)
+MAX_FILE_SIZE = 50 * 1024 * 1024
+
+# YouTube URL + video ID patterns
 _YT_RE = re.compile(
     r"^https?://(www\.)?(youtube\.com/watch\?v=[\w\-]{11}|youtu\.be/[\w\-]{11}|youtube\.com/shorts/[\w\-]{11})"
 )
-
-# Video ID extraction
 _YT_ID_RE = re.compile(r"(?:v=|youtu\.be/|shorts/)([\w\-]{11})")
 
-# Piped instance to use as a proxy (avoids YouTube bot detection on server IPs)
-PIPED_INSTANCE = "https://piped.video"
+# Piped API instances (tried in order, falls back if one is down)
+_PIPED_INSTANCES = [
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.adminforge.de",
+    "https://piped-api.privacy.com.de",
+]
 
 
-def _to_piped_url(youtube_url: str) -> str:
-    """Convert a YouTube URL to a Piped URL for bot-detection bypass."""
-    m = _YT_ID_RE.search(youtube_url)
-    if not m:
-        return youtube_url
-    return f"{PIPED_INSTANCE}/watch?v={m.group(1)}"
+def _get_piped_audio(video_id: str) -> tuple[str, float | None]:
+    """
+    Fetch audio stream URL and duration from Piped API.
+    Tries multiple instances and returns the first success.
+    Returns (stream_url, duration_seconds).
+    """
+    last_err: Exception | None = None
+    for instance in _PIPED_INSTANCES:
+        try:
+            req = urllib.request.Request(
+                f"{instance}/streams/{video_id}",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
+
+            duration = float(data["duration"]) if data.get("duration") else None
+            streams = data.get("audioStreams", [])
+            if not streams:
+                raise ValueError("No audio streams returned")
+
+            # Pick highest-bitrate stream
+            best = max(streams, key=lambda s: s.get("bitrate", 0))
+            return best["url"], duration
+
+        except Exception as e:
+            logging.warning("Piped instance %s failed: %s", instance, e)
+            last_err = e
+            continue
+
+    raise RuntimeError(f"All Piped instances failed. Last error: {last_err}")
 
 
 class ProcessRequest(BaseModel):
@@ -86,13 +116,13 @@ class ProcessRequest(BaseModel):
 
 def _check_rate_limit(client_ip: str) -> None:
     now = time.monotonic()
-    timestamps = _rate_limit_store[client_ip]
-    # Prune old entries
-    _rate_limit_store[client_ip] = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
+    _rate_limit_store[client_ip] = [
+        t for t in _rate_limit_store[client_ip] if now - t < RATE_LIMIT_WINDOW
+    ]
     if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_MAX:
         raise HTTPException(
             status_code=429,
-            detail=f"Too many requests. Please wait before trying again.",
+            detail="Too many requests. Please wait before trying again.",
         )
     _rate_limit_store[client_ip].append(now)
 
@@ -107,19 +137,20 @@ async def process_video(req: ProcessRequest, request: Request):
     client_ip = request.client.host if request.client else "unknown"
     _check_rate_limit(client_ip)
 
-    url = req.url  # already stripped/validated by Pydantic
+    url = req.url
+    video_id_match = _YT_ID_RE.search(url)
+    if not video_id_match:
+        raise HTTPException(status_code=400, detail="Could not extract video ID from URL")
+    video_id = video_id_match.group(1)
 
     job_id = str(uuid.uuid4())[:8]
     job_dir = WORK_DIR / job_id
     job_dir.mkdir(exist_ok=True)
-
     input_file = job_dir / "input.wav"
 
-    piped_url = _to_piped_url(url)
-    logging.info("[%s] New job started. Piped URL: %s", job_id, piped_url)
+    logging.info("[%s] New job — video ID: %s", job_id, video_id)
 
     try:
-        # Acquire semaphore so we don't run too many heavy jobs at once
         try:
             logging.info("[%s] Waiting for processing slot...", job_id)
             await asyncio.wait_for(_job_semaphore.acquire(), timeout=900)
@@ -130,54 +161,42 @@ async def process_video(req: ProcessRequest, request: Request):
                 detail="Server is busy. Please try again in a few minutes.",
             )
 
-        song_duration: float | None = None
-
         try:
-            # Step 0: Check video duration before downloading
-            logging.info("[%s] Probing video duration...", job_id)
-            probe_result = await asyncio.to_thread(
-                subprocess.run,
-                [
-                    "yt-dlp",
-                    "--no-playlist",
-                    "--print", "duration",
-                    "--skip-download",
-                    "--js-runtimes", "node",
-                    piped_url,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if probe_result.returncode == 0:
-                raw_duration = probe_result.stdout.strip()
-                try:
-                    song_duration = float(raw_duration)
-                    logging.info("[%s] Video duration: %ds", job_id, int(song_duration))
-                    if song_duration > MAX_DURATION_SECONDS:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Video is too long ({int(song_duration)}s). Maximum is {MAX_DURATION_SECONDS // 60} minutes.",
-                        )
-                except ValueError:
-                    pass  # duration unavailable – fall back to fixed timeout
+            # Step 1: Get audio stream URL from Piped API
+            logging.info("[%s] Fetching stream URL from Piped API...", job_id)
+            try:
+                stream_url, song_duration = await asyncio.to_thread(
+                    _get_piped_audio, video_id
+                )
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Could not fetch audio stream: {e}",
+                )
 
-            # Step 1: Download audio from YouTube
+            logging.info(
+                "[%s] Got stream URL. Duration: %s",
+                job_id,
+                f"{int(song_duration)}s" if song_duration else "unknown",
+            )
+
+            if song_duration and song_duration > MAX_DURATION_SECONDS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Video is too long ({int(song_duration)}s). Maximum is {MAX_DURATION_SECONDS // 60} minutes.",
+                )
+
+            # Step 2: Download audio via ffmpeg (handles all formats, converts to WAV)
             logging.info("[%s] Downloading audio...", job_id)
             dl_result = await asyncio.to_thread(
                 subprocess.run,
                 [
-                    "yt-dlp",
-                    "-x",
-                    "--audio-format", "wav",
-                    "--no-playlist",
-                    "--max-filesize", "50M",
-                    "--no-exec",
-                    "--no-batch-file",
-                    "--no-config",
-                    "--js-runtimes", "node",
-                    "-o", str(input_file),
-                    "--", piped_url,
+                    "ffmpeg", "-y",
+                    "-i", stream_url,
+                    "-vn",                  # drop video
+                    "-acodec", "pcm_s16le", # convert to WAV
+                    "-ar", "44100",         # standard sample rate
+                    str(input_file),
                 ],
                 capture_output=True,
                 text=True,
@@ -185,25 +204,20 @@ async def process_video(req: ProcessRequest, request: Request):
             )
 
             if dl_result.returncode != 0:
-                # Sanitize stderr – never leak server paths
-                stderr_safe = dl_result.stderr[:200] if dl_result.stderr else "Unknown error"
-                stderr_safe = stderr_safe.replace(str(WORK_DIR), "[workdir]")
-                logging.error("[%s] Download failed: %s", job_id, stderr_safe)
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Failed to download audio: {stderr_safe}",
-                )
+                err = (dl_result.stderr or "")[:200]
+                logging.error("[%s] ffmpeg download failed: %s", job_id, err)
+                raise HTTPException(status_code=400, detail="Failed to download audio.")
 
-            # Find the actual downloaded file (yt-dlp may add extension)
-            actual_files = list(job_dir.glob("input*"))
-            if not actual_files:
-                raise HTTPException(status_code=500, detail="Download succeeded but file not found")
-            actual_input = actual_files[0]
-            logging.info("[%s] Download complete: %s (%.1fMB)", job_id, actual_input.name, actual_input.stat().st_size / 1e6)
+            if input_file.stat().st_size > MAX_FILE_SIZE:
+                raise HTTPException(status_code=400, detail="Audio file too large (max 50MB).")
 
-            # Step 2: Run Demucs to separate vocals
-            # Timeout = 3x song duration (floor 5 min, ceiling 20 min).
-            # Falls back to 15 min if duration probe failed.
+            logging.info(
+                "[%s] Download complete (%.1fMB)",
+                job_id,
+                input_file.stat().st_size / 1e6,
+            )
+
+            # Step 3: Run Demucs vocal separation
             demucs_timeout = int(max(300, min(song_duration * 3, 1200))) if song_duration else 900
             logging.info("[%s] Starting vocal separation (timeout: %ds)...", job_id, demucs_timeout)
             t0 = time.time()
@@ -215,7 +229,7 @@ async def process_video(req: ProcessRequest, request: Request):
                     "--two-stems", "vocals",
                     "-o", str(job_dir / "output"),
                     "--mp3",
-                    str(actual_input),
+                    str(input_file),
                 ],
                 capture_output=True,
                 text=True,
@@ -224,21 +238,17 @@ async def process_video(req: ProcessRequest, request: Request):
             elapsed = time.time() - t0
 
             if demucs_result.returncode != 0:
-                combined = (demucs_result.stderr or "") + (demucs_result.stdout or "")
-                combined = combined[:400] if combined else "Unknown error"
+                combined = ((demucs_result.stderr or "") + (demucs_result.stdout or ""))[:400]
                 combined = combined.replace(str(WORK_DIR), "[workdir]")
                 logging.error("[%s] Demucs failed after %.1fs: %s", job_id, elapsed, combined)
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Vocal separation failed: {combined}",
-                )
+                raise HTTPException(status_code=500, detail=f"Vocal separation failed: {combined}")
 
             logging.info("[%s] Vocal separation complete in %.1fs", job_id, elapsed)
 
-            # Step 3: Find the instrumental (no_vocals) track
+            # Step 4: Find the instrumental (no_vocals) track
             output_dir = job_dir / "output" / "mdx_extra_q"
             if not output_dir.exists():
-                raise HTTPException(status_code=500, detail="Vocal separation completed but output directory not found")
+                raise HTTPException(status_code=500, detail="Output directory not found")
 
             no_vocals = None
             for d in output_dir.iterdir():
@@ -253,24 +263,17 @@ async def process_video(req: ProcessRequest, request: Request):
                     break
 
             if no_vocals is None:
-                raise HTTPException(status_code=500, detail="Vocal separation completed but output file not found")
+                raise HTTPException(status_code=500, detail="Output file not found")
 
-            # Move to a servable location
             serve_name = f"{job_id}_karaoke{no_vocals.suffix}"
-            serve_path = WORK_DIR / serve_name
-            shutil.copy2(no_vocals, serve_path)
+            shutil.copy2(no_vocals, WORK_DIR / serve_name)
 
         finally:
             _job_semaphore.release()
 
-        # Cleanup job directory
         shutil.rmtree(job_dir, ignore_errors=True)
-
         logging.info("[%s] Job complete. Serving: %s", job_id, serve_name)
-        return JSONResponse({
-            "status": "success",
-            "audio_url": f"/api/audio/{serve_name}",
-        })
+        return JSONResponse({"status": "success", "audio_url": f"/api/audio/{serve_name}"})
 
     except HTTPException:
         shutil.rmtree(job_dir, ignore_errors=True)
@@ -287,12 +290,10 @@ async def process_video(req: ProcessRequest, request: Request):
 
 @app.get("/api/audio/{filename}")
 async def serve_audio(filename: str):
-    # Strict allowlist: job_id (hex) + _karaoke + .mp3/.wav
     if not re.fullmatch(r"[a-f0-9]{8}_karaoke\.(mp3|wav)", filename):
         raise HTTPException(status_code=400, detail="Invalid filename")
 
     file_path = (WORK_DIR / filename).resolve()
-    # Ensure resolved path is still under WORK_DIR
     if not str(file_path).startswith(str(WORK_DIR.resolve())):
         raise HTTPException(status_code=400, detail="Invalid filename")
 
@@ -319,7 +320,7 @@ async def health():
 async def _start_cleanup_task():
     async def _cleanup_loop():
         while True:
-            await asyncio.sleep(300)  # every 5 minutes
+            await asyncio.sleep(300)
             try:
                 cutoff = time.time() - 3600
                 for p in WORK_DIR.iterdir():
