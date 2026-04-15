@@ -32,9 +32,7 @@ COPY . .
 # Create work directory with correct permissions
 RUN mkdir -p /tmp/karaoke_work && chown appuser:appuser /tmp/karaoke_work
 
-# Switch to non-root user and pre-download the Demucs model so it's baked into the image
 USER appuser
-RUN python -c "from demucs.pretrained import get_model; get_model('mdx_extra_q')"
 
 EXPOSE 7860
 
