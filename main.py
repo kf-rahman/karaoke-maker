@@ -67,7 +67,12 @@ _YT_RE = re.compile(
 
 def _yt_dlp_base_args() -> list[str]:
     """Common yt-dlp flags used in every call."""
-    args = ["yt-dlp", "--no-playlist", "--js-runtimes", "node"]
+    args = [
+        "yt-dlp",
+        "--no-playlist",
+        "--js-runtimes", "node",
+        "--remote-components", "ejs:github",
+    ]
     if COOKIES_FILE.exists():
         args += ["--cookies", str(COOKIES_FILE)]
     return args
