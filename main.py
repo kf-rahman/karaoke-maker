@@ -203,10 +203,10 @@ async def process_video(req: ProcessRequest, request: Request):
             elapsed = time.time() - t0
 
             if demucs.returncode != 0:
-                combined = ((demucs.stderr or "") + (demucs.stdout or ""))[:400]
+                combined = ((demucs.stderr or "") + (demucs.stdout or ""))
                 combined = combined.replace(str(WORK_DIR), "[workdir]")
-                logging.error("[%s] Demucs failed after %.1fs: %s", job_id, elapsed, combined)
-                raise HTTPException(status_code=500, detail=f"Vocal separation failed: {combined}")
+                logging.error("[%s] Demucs failed after %.1fs:\n%s", job_id, elapsed, combined)
+                raise HTTPException(status_code=500, detail=f"Vocal separation failed: {combined[-800:]}")
 
             logging.info("[%s] Vocal separation complete in %.1fs", job_id, elapsed)
 
