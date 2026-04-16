@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cpu
 
 # Install demucs and its deps separately (pin numpy<2 for demucs 4.0.1 compatibility)
-RUN pip install --no-cache-dir "numpy<2" demucs==4.0.1
+RUN pip install --no-cache-dir "numpy<2" demucs==4.0.1 diffq
 
 # Install web framework
 RUN pip install --no-cache-dir \
