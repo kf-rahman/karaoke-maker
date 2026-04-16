@@ -329,6 +329,28 @@
                     throw new Error('Server returned an invalid response. Please try again.');
                 }
 
+                if (res.status === 429) {
+                    stopProgress();
+                    statusMsg.className = 'message error';
+                    let secs = 60;
+                    statusMsg.textContent = `Too many requests. Try again in ${secs}s.`;
+                    const countdown = setInterval(() => {
+                        secs--;
+                        if (secs <= 0) {
+                            clearInterval(countdown);
+                            statusMsg.className = 'message';
+                            statusMsg.textContent = 'Ready. Paste a URL and try again.';
+                            goBtn.disabled = false;
+                            urlInput.disabled = false;
+                        } else {
+                            statusMsg.textContent = `Too many requests. Try again in ${secs}s.`;
+                        }
+                    }, 1000);
+                    isProcessing = false;
+                    abortController = null;
+                    return;
+                }
+
                 if (!res.ok) {
                     throw new Error(data.detail || 'Something went wrong');
                 }
