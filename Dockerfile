@@ -35,6 +35,9 @@ RUN mkdir -p /tmp/karaoke_work && chown appuser:appuser /tmp/karaoke_work
 
 USER appuser
 
-EXPOSE 7860
+# Pre-download the Demucs model so it's baked into the image (no cold start delay)
+RUN python -c "from demucs.pretrained import get_model; get_model('mdx_extra')"
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860", "--timeout-keep-alive", "1850"]
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-keep-alive", "1850"]
