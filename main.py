@@ -24,11 +24,9 @@ from collections import defaultdict
 app = FastAPI(docs_url=None, redoc_url=None)
 
 # ---------------------------------------------------------------------------
-# YouTube cookies — loaded from YOUTUBE_COOKIES env var (HF Space secret).
-# Written to a temp file once at startup so yt-dlp can use them.
+# YouTube cookies
 # ---------------------------------------------------------------------------
 COOKIES_FILE = Path("/tmp/yt_cookies.txt")
-
 _cookies_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
 if _cookies_content:
     COOKIES_FILE.write_text(_cookies_content)
@@ -37,39 +35,38 @@ else:
     logging.warning("YOUTUBE_COOKIES not set — downloads may fail on server IPs.")
 
 # ---------------------------------------------------------------------------
-# Rate limiting (simple in-memory, per-IP)
+# Rate limiting
 # ---------------------------------------------------------------------------
 _rate_limit_store: dict[str, list[float]] = defaultdict(list)
-RATE_LIMIT_WINDOW = 60  # seconds
-RATE_LIMIT_MAX = 3       # max requests per window
+RATE_LIMIT_WINDOW = 60
+RATE_LIMIT_MAX = 3
 
 # ---------------------------------------------------------------------------
-# Concurrency guard – one Demucs job at a time on CPU
+# Concurrency guard
 # ---------------------------------------------------------------------------
 MAX_CONCURRENT_JOBS = 1
 _job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
-# Serve frontend
+# ---------------------------------------------------------------------------
+# Job state store  {job_id -> {status, audio_url, error, started_at}}
+# ---------------------------------------------------------------------------
+_jobs: dict[str, dict] = {}
+
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Temp directory for processing
 WORK_DIR = Path("/tmp/karaoke_work")
 WORK_DIR.mkdir(exist_ok=True)
 
-# Maximum allowed audio duration in seconds (10 minutes)
 MAX_DURATION_SECONDS = 600
 
-# YouTube URL pattern
 _YT_RE = re.compile(
     r"^https?://(www\.)?(youtube\.com/watch\?v=[\w\-]{11}|youtu\.be/[\w\-]{11}|youtube\.com/shorts/[\w\-]{11})"
 )
 
 
 def _yt_dlp_base_args() -> list[str]:
-    """Common yt-dlp flags used in every call."""
     args = [
-        "yt-dlp",
-        "--no-playlist",
+        "yt-dlp", "--no-playlist",
         "--js-runtimes", "node",
         "--remote-components", "ejs:github",
     ]
@@ -101,25 +98,11 @@ def _check_rate_limit(client_ip: str) -> None:
         t for t in _rate_limit_store[client_ip] if now - t < RATE_LIMIT_WINDOW
     ]
     if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_MAX:
-        raise HTTPException(
-            status_code=429,
-            detail="Too many requests. Please wait before trying again.",
-        )
+        raise HTTPException(status_code=429, detail="Too many requests. Please wait before trying again.")
     _rate_limit_store[client_ip].append(now)
 
 
-@app.get("/")
-async def serve_frontend():
-    return FileResponse("static/index.html")
-
-
-@app.post("/api/process")
-async def process_video(req: ProcessRequest, request: Request):
-    client_ip = request.client.host if request.client else "unknown"
-    _check_rate_limit(client_ip)
-
-    url = req.url
-    job_id = str(uuid.uuid4())[:8]
+async def _run_job(job_id: str, url: str):
     job_dir = WORK_DIR / job_id
     job_dir.mkdir(exist_ok=True)
     input_file = job_dir / "input.wav"
@@ -127,17 +110,13 @@ async def process_video(req: ProcessRequest, request: Request):
     logging.info("[%s] New job: %s", job_id, url)
 
     try:
+        logging.info("[%s] Waiting for processing slot...", job_id)
         try:
-            logging.info("[%s] Waiting for processing slot...", job_id)
-            await asyncio.wait_for(_job_semaphore.acquire(), timeout=900)
+            await asyncio.wait_for(_job_semaphore.acquire(), timeout=1800)
         except asyncio.TimeoutError:
+            _jobs[job_id] = {"status": "error", "error": "Server is busy. Please try again in a few minutes."}
             shutil.rmtree(job_dir, ignore_errors=True)
-            raise HTTPException(
-                status_code=503,
-                detail="Server is busy. Please try again in a few minutes.",
-            )
-
-        song_duration: float | None = None
+            return
 
         try:
             # Step 0: Probe duration
@@ -147,20 +126,20 @@ async def process_video(req: ProcessRequest, request: Request):
                 _yt_dlp_base_args() + ["--print", "duration", "--skip-download", url],
                 capture_output=True, text=True, timeout=30,
             )
+            song_duration: float | None = None
             if probe.returncode == 0:
                 try:
                     song_duration = float(probe.stdout.strip())
                     logging.info("[%s] Duration: %ds", job_id, int(song_duration))
                     if song_duration > MAX_DURATION_SECONDS:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Video is too long ({int(song_duration)}s). Maximum is {MAX_DURATION_SECONDS // 60} minutes.",
-                        )
+                        _jobs[job_id] = {"status": "error", "error": f"Video is too long ({int(song_duration)}s). Maximum is {MAX_DURATION_SECONDS // 60} minutes."}
+                        return
                 except ValueError:
-                    pass  # duration unavailable – fall back to fixed timeout
+                    pass
 
             # Step 1: Download audio
             logging.info("[%s] Downloading audio...", job_id)
+            _jobs[job_id]["step"] = "downloading"
             dl = await asyncio.to_thread(
                 subprocess.run,
                 _yt_dlp_base_args() + [
@@ -174,19 +153,22 @@ async def process_video(req: ProcessRequest, request: Request):
             )
 
             if dl.returncode != 0:
-                err = (dl.stderr or "")[:200].replace(str(WORK_DIR), "[workdir]")
+                err = (dl.stderr or "")[:300].replace(str(WORK_DIR), "[workdir]")
                 logging.error("[%s] Download failed: %s", job_id, err)
-                raise HTTPException(status_code=400, detail=f"Failed to download audio: {err}")
+                _jobs[job_id] = {"status": "error", "error": f"Failed to download audio: {err}"}
+                return
 
             actual_files = list(job_dir.glob("input*"))
             if not actual_files:
-                raise HTTPException(status_code=500, detail="Download succeeded but file not found")
+                _jobs[job_id] = {"status": "error", "error": "Download succeeded but file not found."}
+                return
             actual_input = actual_files[0]
             logging.info("[%s] Download complete (%.1fMB)", job_id, actual_input.stat().st_size / 1e6)
 
             # Step 2: Vocal separation
-            demucs_timeout = int(max(600, min(song_duration * 5, 1800))) if song_duration else 1200
+            demucs_timeout = int(max(600, min(song_duration * 6, 1800))) if song_duration else 1800
             logging.info("[%s] Starting vocal separation (timeout: %ds)...", job_id, demucs_timeout)
+            _jobs[job_id]["step"] = "separating"
             t0 = time.time()
             demucs = await asyncio.to_thread(
                 subprocess.run,
@@ -205,15 +187,17 @@ async def process_video(req: ProcessRequest, request: Request):
             if demucs.returncode != 0:
                 combined = ((demucs.stderr or "") + (demucs.stdout or ""))
                 combined = combined.replace(str(WORK_DIR), "[workdir]")
-                logging.error("[%s] Demucs failed after %.1fs:\n%s", job_id, elapsed, combined)
-                raise HTTPException(status_code=500, detail=f"Vocal separation failed: {combined[-800:]}")
+                logging.error("[%s] Demucs failed after %.1fs: %s", job_id, elapsed, combined)
+                _jobs[job_id] = {"status": "error", "error": f"Vocal separation failed: {combined[-500:]}"}
+                return
 
             logging.info("[%s] Vocal separation complete in %.1fs", job_id, elapsed)
 
-            # Step 3: Find output file
+            # Step 3: Find output
             output_dir = job_dir / "output" / "mdx_extra"
             if not output_dir.exists():
-                raise HTTPException(status_code=500, detail="Output directory not found")
+                _jobs[job_id] = {"status": "error", "error": "Output directory not found."}
+                return
 
             no_vocals = None
             for d in output_dir.iterdir():
@@ -228,47 +212,66 @@ async def process_video(req: ProcessRequest, request: Request):
                     break
 
             if no_vocals is None:
-                raise HTTPException(status_code=500, detail="Output file not found")
+                _jobs[job_id] = {"status": "error", "error": "Output file not found."}
+                return
 
             serve_name = f"{job_id}_karaoke{no_vocals.suffix}"
             shutil.copy2(no_vocals, WORK_DIR / serve_name)
+            logging.info("[%s] Job complete. Serving: %s", job_id, serve_name)
+            _jobs[job_id] = {"status": "complete", "audio_url": f"/api/audio/{serve_name}"}
 
         finally:
             _job_semaphore.release()
+            shutil.rmtree(job_dir, ignore_errors=True)
 
-        shutil.rmtree(job_dir, ignore_errors=True)
-        logging.info("[%s] Job complete. Serving: %s", job_id, serve_name)
-        return JSONResponse({"status": "success", "audio_url": f"/api/audio/{serve_name}"})
-
-    except HTTPException:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        raise
     except subprocess.TimeoutExpired:
         logging.error("[%s] Job timed out", job_id)
+        _jobs[job_id] = {"status": "error", "error": "Processing timed out. Try a shorter song."}
         shutil.rmtree(job_dir, ignore_errors=True)
-        raise HTTPException(status_code=504, detail="Processing timed out. Try a shorter song.")
     except Exception:
         logging.exception("[%s] Unexpected error", job_id)
+        _jobs[job_id] = {"status": "error", "error": "An internal error occurred."}
         shutil.rmtree(job_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail="An internal error occurred.")
+
+
+@app.get("/")
+async def serve_frontend():
+    return FileResponse("static/index.html")
+
+
+@app.post("/api/process")
+async def process_video(req: ProcessRequest, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(client_ip)
+
+    job_id = str(uuid.uuid4())[:8]
+    _jobs[job_id] = {"status": "processing", "step": "queued", "started_at": time.time()}
+    asyncio.create_task(_run_job(job_id, req.url))
+    return JSONResponse({"job_id": job_id})
+
+
+@app.get("/api/status/{job_id}")
+async def job_status(job_id: str):
+    if not re.fullmatch(r"[a-f0-9]{8}", job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return JSONResponse(job)
 
 
 @app.get("/api/audio/{filename}")
 async def serve_audio(filename: str):
     if not re.fullmatch(r"[a-f0-9]{8}_karaoke\.(mp3|wav)", filename):
         raise HTTPException(status_code=400, detail="Invalid filename")
-
     file_path = (WORK_DIR / filename).resolve()
     if not str(file_path).startswith(str(WORK_DIR.resolve())):
         raise HTTPException(status_code=400, detail="Invalid filename")
-
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Audio file not found")
-
     media_type = "audio/mpeg" if file_path.suffix == ".mp3" else "audio/wav"
     return FileResponse(
-        file_path,
-        media_type=media_type,
+        file_path, media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
@@ -278,9 +281,6 @@ async def health():
     return {"status": "ok"}
 
 
-# ---------------------------------------------------------------------------
-# Periodic cleanup of stale files (older than 1 hour)
-# ---------------------------------------------------------------------------
 @app.on_event("startup")
 async def _start_cleanup_task():
     async def _cleanup_loop():
@@ -297,7 +297,10 @@ async def _start_cleanup_task():
                                 p.unlink(missing_ok=True)
                     except OSError:
                         pass
+                # Clean up old job records
+                for jid in list(_jobs.keys()):
+                    if time.time() - _jobs[jid].get("started_at", time.time()) > 7200:
+                        del _jobs[jid]
             except Exception:
                 pass
-
     asyncio.create_task(_cleanup_loop())

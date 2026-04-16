@@ -101,26 +101,33 @@
         .status .message {
             color: #555;
             font-size: 0.95rem;
+            margin-bottom: 1rem;
         }
 
         .status .error {
             color: #ef4444;
         }
 
-        .spinner {
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 3px solid #ddd;
-            border-top-color: #7c3aed;
-            border-radius: 50%;
-            animation: spin 0.8s linear infinite;
-            vertical-align: middle;
-            margin-right: 0.5rem;
+        .progress-wrap {
+            background: #e5e5e5;
+            border-radius: 999px;
+            height: 8px;
+            overflow: hidden;
+            margin-top: 0.75rem;
         }
 
-        @keyframes spin {
-            to { transform: rotate(360deg); }
+        .progress-bar {
+            height: 100%;
+            width: 0%;
+            background: #7c3aed;
+            border-radius: 999px;
+            transition: width 0.6s ease;
+        }
+
+        .progress-label {
+            font-size: 0.8rem;
+            color: #888;
+            margin-top: 0.4rem;
         }
 
         .player {
@@ -206,6 +213,10 @@
 
         <div class="status" id="status" role="status" aria-live="polite">
             <p class="message" id="statusMsg"></p>
+            <div class="progress-wrap" id="progressWrap" style="display:none">
+                <div class="progress-bar" id="progressBar"></div>
+            </div>
+            <p class="progress-label" id="progressLabel"></p>
         </div>
 
         <div class="player" id="player">
@@ -224,6 +235,9 @@
         const goBtn = document.getElementById('goBtn');
         const status = document.getElementById('status');
         const statusMsg = document.getElementById('statusMsg');
+        const progressWrap = document.getElementById('progressWrap');
+        const progressBar = document.getElementById('progressBar');
+        const progressLabel = document.getElementById('progressLabel');
         const player = document.getElementById('player');
         const audio = document.getElementById('audio');
         const downloadLink = document.getElementById('downloadLink');
@@ -231,6 +245,7 @@
 
         let isProcessing = false;
         let abortController = null;
+        let progressInterval = null;
 
         function handleSubmit(e) {
             e.preventDefault();
@@ -246,7 +261,38 @@
             actions.classList.remove('visible');
             status.classList.remove('visible');
             audio.src = '';
+            stopProgress();
             urlInput.focus();
+        }
+
+        function startProgress() {
+            // Animate from 0% to 90% over ~3 minutes, then hold until done
+            const totalMs = 180000;
+            const startTime = Date.now();
+            progressWrap.style.display = 'block';
+            progressBar.style.width = '0%';
+            progressLabel.textContent = '';
+
+            progressInterval = setInterval(() => {
+                const elapsed = Date.now() - startTime;
+                const pct = Math.min(90, (elapsed / totalMs) * 90);
+                progressBar.style.width = pct.toFixed(1) + '%';
+                const secsElapsed = Math.floor(elapsed / 1000);
+                progressLabel.textContent = `${secsElapsed}s elapsed`;
+            }, 500);
+        }
+
+        function finishProgress() {
+            clearInterval(progressInterval);
+            progressBar.style.width = '100%';
+            progressLabel.textContent = 'Done!';
+        }
+
+        function stopProgress() {
+            clearInterval(progressInterval);
+            progressWrap.style.display = 'none';
+            progressBar.style.width = '0%';
+            progressLabel.textContent = '';
         }
 
         async function process() {
@@ -256,23 +302,17 @@
             isProcessing = true;
             abortController = new AbortController();
 
-            // Disable input
             goBtn.disabled = true;
             urlInput.disabled = true;
             player.classList.remove('visible');
             actions.classList.remove('visible');
 
-            // Show loading
             status.classList.add('visible');
             statusMsg.className = 'message';
-            statusMsg.textContent = 'Downloading audio...';
+            statusMsg.textContent = 'Starting...';
+            startProgress();
 
-            // Update message after a delay
-            const msgTimer = setTimeout(() => {
-                if (isProcessing) {
-                    statusMsg.textContent = 'Removing vocals... this takes 1-3 minutes';
-                }
-            }, 5000);
+            let jobId = null;
 
             try {
                 const res = await fetch('/api/process', {
@@ -281,8 +321,6 @@
                     body: JSON.stringify({ url }),
                     signal: abortController.signal,
                 });
-
-                clearTimeout(msgTimer);
 
                 let data;
                 try {
@@ -295,15 +333,44 @@
                     throw new Error(data.detail || 'Something went wrong');
                 }
 
-                // Show player
-                statusMsg.textContent = 'Done!';
-                audio.src = data.audio_url;
-                downloadLink.href = data.audio_url;
-                player.classList.add('visible');
-                actions.classList.add('visible');
+                jobId = data.job_id;
+                statusMsg.textContent = 'Downloading audio...';
+
+                // Poll for job completion
+                while (isProcessing) {
+                    await new Promise(r => setTimeout(r, 5000));
+                    if (!isProcessing) break;
+
+                    const pollRes = await fetch(`/api/status/${jobId}`, {
+                        signal: abortController.signal,
+                    });
+                    const pollData = await pollRes.json();
+
+                    if (pollData.status === 'complete') {
+                        finishProgress();
+                        statusMsg.textContent = 'Done!';
+                        audio.src = pollData.audio_url;
+                        downloadLink.href = pollData.audio_url;
+                        player.classList.add('visible');
+                        actions.classList.add('visible');
+                        break;
+                    } else if (pollData.status === 'error') {
+                        throw new Error(pollData.error || 'Processing failed');
+                    } else {
+                        // Update status message based on step
+                        const step = pollData.step || '';
+                        if (step === 'downloading') {
+                            statusMsg.textContent = 'Downloading audio...';
+                        } else if (step === 'separating') {
+                            statusMsg.textContent = 'Removing vocals (this takes a few minutes)...';
+                        } else if (step === 'queued') {
+                            statusMsg.textContent = 'Queued, waiting for processing slot...';
+                        }
+                    }
+                }
 
             } catch (err) {
-                clearTimeout(msgTimer);
+                stopProgress();
                 if (err.name === 'AbortError') return;
                 statusMsg.className = 'message error';
                 statusMsg.textContent = err.message;
