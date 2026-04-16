@@ -149,7 +149,7 @@ async def _run_job(job_id: str, url: str):
                     "-o", str(input_file),
                     "--", url,
                 ],
-                capture_output=True, text=True, timeout=120,
+                capture_output=True, text=True, timeout=300,
             )
 
             if dl.returncode != 0:
@@ -166,7 +166,7 @@ async def _run_job(job_id: str, url: str):
             logging.info("[%s] Download complete (%.1fMB)", job_id, actual_input.stat().st_size / 1e6)
 
             # Step 2: Vocal separation
-            demucs_timeout = int(max(600, min(song_duration * 6, 1800))) if song_duration else 1800
+            demucs_timeout = int(max(900, min(song_duration * 15, 5400))) if song_duration else 5400
             logging.info("[%s] Starting vocal separation (timeout: %ds)...", job_id, demucs_timeout)
             _jobs[job_id]["step"] = "separating"
             t0 = time.time()
