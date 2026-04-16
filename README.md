@@ -1,19 +1,24 @@
 # Karaoke Maker
 
-Paste a YouTube link, get back an instrumental track you can sing over. Vocals are stripped in ~30–60 seconds using [Spleeter](https://github.com/deezer/spleeter) (Deezer's open-source audio separation model).
+Paste a YouTube link, get back an instrumental track you can sing over. Vocals are stripped in **30–60 seconds** using [Spleeter](https://github.com/deezer/spleeter) (Deezer's open-source audio separation model).
 
 **Live demo:** [karaoke-maker-production.up.railway.app](https://karaoke-maker-production.up.railway.app)
+
+> **Legal notice:** This tool is intended for personal and educational use. Downloading audio from YouTube may be subject to [YouTube's Terms of Service](https://www.youtube.com/t/terms). You are responsible for ensuring your use complies with applicable laws and terms.
 
 ---
 
 ## Table of Contents
 
 - [How It Works](#how-it-works)
+- [Project Structure](#project-structure)
 - [Architecture](#architecture)
+- [API Reference](#api-reference)
 - [Tech Stack & Why We Chose It](#tech-stack--why-we-chose-it)
 - [Running Locally](#running-locally)
 - [Deploying to Railway](#deploying-to-railway)
 - [Configuration](#configuration)
+- [Operational Notes](#operational-notes)
 - [Roadblocks We Hit (and How We Solved Them)](#roadblocks-we-hit-and-how-we-solved-them)
 - [What We'd Do Differently](#what-wed-do-differently)
 - [Limitations](#limitations)
@@ -22,17 +27,33 @@ Paste a YouTube link, get back an instrumental track you can sing over. Vocals a
 
 ## How It Works
 
-1. User pastes a YouTube URL into the UI
-2. The server downloads the audio via `yt-dlp`
-3. Spleeter separates the audio into two stems: `vocals` and `accompaniment`
-4. The `accompaniment` track (everything except vocals) is served back
-5. User plays it in-browser or downloads it
+1. User pastes a YouTube URL into the UI and clicks **Go**
+2. The server downloads the audio via `yt-dlp` (~5–10 seconds)
+3. Spleeter splits the audio into two stems: `vocals` and `accompaniment`
+4. The `accompaniment` track (everything except vocals) is served back (~30–60 seconds total)
+5. User plays it in-browser or downloads the MP3
+
+---
+
+## Project Structure
+
+```
+karaoke-app/
+├── main.py              # FastAPI backend — all routes and job logic
+├── static/
+│   └── index.html       # Single-page frontend (vanilla HTML/CSS/JS)
+├── Dockerfile           # Production image (x86_64, used by Railway)
+├── Dockerfile.local     # Local development image (works on ARM64 Macs)
+├── railway.json         # Railway deployment config (healthcheck, restart policy)
+├── requirements.txt     # Python dependencies (reference — Docker installs these)
+└── LICENSE
+```
 
 ---
 
 ## Architecture
 
-Processing a song takes 30–90 seconds, which is longer than a typical HTTP request should stay open. To handle this, the app uses a **background job + polling** pattern instead of a single long-lived request.
+Processing a song takes 30–90 seconds — longer than a typical HTTP request should stay open. To handle this, the app uses a **background job + polling** pattern: the request returns immediately with a `job_id`, and the frontend polls for status until the job completes.
 
 ```mermaid
 sequenceDiagram
@@ -43,12 +64,8 @@ sequenceDiagram
 
     Browser->>FastAPI: POST /api/process { url }
     FastAPI-->>Browser: 200 { job_id } (instant)
-    FastAPI->>FastAPI: asyncio.create_task(_run_job)
 
-    loop Poll every 5 seconds
-        Browser->>FastAPI: GET /api/status/{job_id}
-        FastAPI-->>Browser: { status: "processing", step: "downloading" }
-    end
+    Note over FastAPI: asyncio.create_task(_run_job) — runs in background
 
     FastAPI->>yt-dlp: download audio as WAV
     yt-dlp-->>FastAPI: input.wav
@@ -57,6 +74,12 @@ sequenceDiagram
     Spleeter-->>FastAPI: accompaniment.mp3
 
     FastAPI->>FastAPI: copy to /tmp/karaoke_work/{job_id}_karaoke.mp3
+    FastAPI->>FastAPI: _jobs[job_id] = { status: "complete", audio_url: ... }
+
+    loop Every 5 seconds (concurrent with background job above)
+        Browser->>FastAPI: GET /api/status/{job_id}
+        FastAPI-->>Browser: { status: "processing", step: "downloading" }
+    end
 
     Browser->>FastAPI: GET /api/status/{job_id}
     FastAPI-->>Browser: { status: "complete", audio_url: "/api/audio/..." }
@@ -69,45 +92,72 @@ sequenceDiagram
 
 | Decision | Reason |
 |---|---|
-| Background jobs + polling | Railway's HTTP proxy times out after 5 minutes; processing takes longer |
-| In-memory job store (`_jobs` dict) | Simplest possible state store for a single-replica app |
-| `asyncio.Semaphore(1)` | Limits to 1 concurrent Spleeter job — CPU can't handle more |
-| Files served from `/tmp` | No object storage needed; files cleaned up after 1 hour |
-| Rate limit: 3 req / IP / 60s | Prevents a single user from queuing up the server |
+| Background jobs + polling | Railway's HTTP proxy times out after 5 minutes; processing takes 30–90 seconds and could grow |
+| In-memory job store (`_jobs` dict) | Simplest possible state store for a single-replica app — no external DB needed |
+| `asyncio.Semaphore(1)` | Limits to 1 concurrent Spleeter job — each job uses ~2–3 GB RAM and saturates the CPU |
+| Files served from `/tmp` | No object storage needed; files are cleaned up automatically after 1 hour |
+| Rate limit: 3 req / IP / 60s | Prevents one user from monopolising the queue |
+
+---
+
+## API Reference
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/process` | Submit a YouTube URL. Returns `{ job_id }` immediately. Body: `{ "url": "https://..." }` |
+| `GET` | `/api/status/{job_id}` | Poll for job status. Returns `{ status, step?, audio_url?, error? }` |
+| `GET` | `/api/audio/{filename}` | Download or stream the processed MP3. Filename format: `{job_id}_karaoke.mp3` |
+| `GET` | `/api/health` | Health check. Returns `{ "status": "ok" }` |
+
+**Job status values:**
+
+| `status` | `step` | Meaning |
+|---|---|---|
+| `processing` | `queued` | Waiting for the previous job to finish |
+| `processing` | `downloading` | yt-dlp is downloading the audio |
+| `processing` | `separating` | Spleeter is removing vocals |
+| `complete` | — | Done. `audio_url` is populated |
+| `error` | — | Failed. `error` contains a human-readable message |
 
 ---
 
 ## Tech Stack & Why We Chose It
 
 ### Spleeter (Deezer) — vocal separation
-We started with **Demucs** (Meta's model, state of the art) but discovered it takes **10–20 minutes per song** on CPU. Spleeter processes the same song in **30–60 seconds** on CPU. For a karaoke app, speed matters more than research-grade audio quality — Spleeter's output is perfectly good for singing over.
+We started with **Demucs** (Meta's model, state of the art) but discovered it takes **10–20 minutes per song** on CPU. Spleeter processes the same song in **30–60 seconds** on the same hardware. For a karaoke app, speed matters more than research-grade audio quality — Spleeter's output is perfectly good for singing over.
 
 ### yt-dlp — YouTube downloading
-The de-facto standard for YouTube audio extraction. We use:
-- `--js-runtimes node` — uses Node.js to solve YouTube's JS challenges
-- `--remote-components ejs:github` — pulls the latest JS solver to handle bot detection
-- `--cookies` — browser cookies to bypass IP-based rate limits on server IPs (see roadblocks below)
+The de-facto standard for YouTube audio extraction. We use three flags to work around server-side restrictions:
+- `--js-runtimes node` — uses system Node.js to solve YouTube's JS challenges
+- `--remote-components ejs:github` — fetches the latest YouTube JS solver from GitHub at runtime (yt-dlp's plugin system for keeping up with YouTube's anti-bot updates)
+- `--cookies` — passes your browser session cookies so requests don't look like they're coming from a datacenter IP
 
 ### FastAPI — web framework
-Async-native Python framework. The `asyncio.to_thread()` call wraps the blocking Spleeter subprocess so it doesn't block the event loop while processing.
+Async-native Python framework. The `asyncio.to_thread()` call wraps the blocking Spleeter subprocess so the event loop stays free while audio is being processed.
 
 ### Docker — containerization
-All dependencies (FFmpeg, Node.js, Python, Spleeter, TensorFlow) are baked into the image. The Spleeter `2stems` model (~80MB) is pre-downloaded at build time so there's no cold-start delay on first request.
+All dependencies (FFmpeg, Node.js, Python, Spleeter, TensorFlow) are baked into the image at build time. The Spleeter `2stems` model (~80 MB) is pre-downloaded during the build so the first request has no cold-start delay.
 
 ### Railway — hosting
+**Cost: ~$5–10/month** on the Hobby plan (usage-based).
+
 We chose Railway over HuggingFace Spaces because:
-- HF Spaces free tier is too slow (same 20-min Demucs problem)
-- HF Spaces **blocks outbound network during Docker build**, so model pre-download fails
-- Railway allows network access during build and gives dedicated CPU with predictable performance
+- HF Spaces **blocks outbound network during Docker build** — model pre-download fails silently
+- HF Spaces free tier CPU is too slow for any ML inference
+- Railway allows network access during build, gives dedicated CPU, and `$PORT` injection works cleanly
 
 ---
 
 ## Running Locally
 
-Requires Docker.
+**Prerequisites:** Docker (no other setup required)
 
 ```bash
-# Build (uses Dockerfile.local which is tuned for ARM64 Macs)
+# Clone the repo
+git clone https://github.com/your-username/karaoke-maker.git
+cd karaoke-maker
+
+# Build — Dockerfile.local works on both ARM64 (Mac) and x86_64
 docker build -f Dockerfile.local -t karaoke-local .
 
 # Run
@@ -116,9 +166,9 @@ docker run -p 8000:8000 karaoke-local
 
 Open [http://localhost:8000](http://localhost:8000).
 
-> First build takes ~5–10 minutes — it downloads TensorFlow and the Spleeter model and bakes them into the image. Subsequent builds are fast due to Docker layer caching.
+> **First build takes ~5–10 minutes** — it downloads TensorFlow and the Spleeter model and bakes them into the image. Subsequent builds are fast due to Docker layer caching.
 
-**Optional:** To enable YouTube downloading without bot detection errors, pass your cookies:
+**With YouTube cookies** (recommended — many videos will fail without them):
 
 ```bash
 docker run -p 8000:8000 \
@@ -130,72 +180,87 @@ docker run -p 8000:8000 \
 
 ## Deploying to Railway
 
-1. Fork this repo
-2. Create a new Railway project → **Deploy from GitHub repo**
-3. Railway auto-detects `railway.json` and uses the `Dockerfile`
-4. Add a `YOUTUBE_COOKIES` environment variable (see below)
-5. That's it — Railway builds and deploys automatically on every push
+**Prerequisites:** Railway account, GitHub account
+
+1. Fork this repo on GitHub
+2. Go to [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo** → select your fork
+3. Railway auto-detects `railway.json` and builds the `Dockerfile`
+4. Once deployed, go to **Variables** and add `YOUTUBE_COOKIES` (see [Getting YouTube Cookies](#getting-youtube-cookies) below)
+5. Trigger a redeploy — Railway builds and deploys automatically on every push after this
+
+> The first build takes ~5–10 minutes. Watch the build logs to confirm the Spleeter model downloads successfully.
 
 ---
 
 ## Configuration
 
-All configuration is via environment variables.
-
 | Variable | Required | Description |
 |---|---|---|
-| `YOUTUBE_COOKIES` | Recommended | Netscape-format cookie file content. Without this, downloads will fail for many videos on server IPs. |
-| `PORT` | Set by Railway | Port to bind uvicorn. Defaults to `8000`. |
+| `YOUTUBE_COOKIES` | **Required for production** | Netscape-format cookie file content. Without this, most downloads will fail on server IPs. |
+| `PORT` | Auto-set by Railway | Port to bind uvicorn. Defaults to `8000` if not set. |
 
 ### Getting YouTube Cookies
 
-YouTube blocks requests from server IP ranges. The fix is to export your own browser cookies and pass them to yt-dlp.
+YouTube blocks datacenter IP ranges. Passing your own logged-in browser cookies makes requests look like they come from a real user.
 
 1. Install the [Get cookies.txt LOCALLY](https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) Chrome extension
-2. Log in to YouTube in your browser
-3. Click the extension → **Export** → copy the file contents
-4. In Railway: **Variables** → add `YOUTUBE_COOKIES` → paste the contents
+2. Go to [youtube.com](https://youtube.com) and make sure you're logged in
+3. Click the extension icon → **Export** — this downloads a `cookies.txt` file
+4. In Railway: **Variables** tab → **New Variable** → name: `YOUTUBE_COOKIES`, value: paste the full file contents
 
-> Cookies expire periodically. If downloads start failing again, re-export and update the variable.
+> **Security note:** Your cookies file contains active session tokens. Treat it like a password — never commit it to git, and don't share it.
+
+---
+
+## Operational Notes
+
+### Cookie expiry
+YouTube cookies expire. When they do, downloads start returning `403` errors. The fix is to re-export from your browser and update the `YOUTUBE_COOKIES` Railway variable. How often this happens varies (typically every few weeks to a few months depending on account activity).
+
+### Queue behaviour
+Only one song is processed at a time. If a second request comes in while one is processing, it waits in the queue (up to 30 minutes) with a `queued` status. In practice with Spleeter, the wait is usually under 2 minutes.
+
+### File cleanup
+Processed MP3 files are stored in `/tmp/karaoke_work/` and deleted automatically after 1 hour. Job records in memory are cleared after 2 hours. There is no persistent storage — files are lost on container restart.
 
 ---
 
 ## Roadblocks We Hit (and How We Solved Them)
 
 ### 1. YouTube blocks server IPs
-Server IP ranges (AWS, Railway, HuggingFace) are flagged by YouTube and get `HTTP 403` errors. Regular `yt-dlp` with no configuration fails immediately.
+Server IP ranges (AWS, Railway, HuggingFace) are flagged by YouTube and get `HTTP 403` errors. Regular `yt-dlp` with no configuration fails immediately on these IPs.
 
-**Fix:** Export your logged-in browser cookies and pass them to yt-dlp via `--cookies`. The request looks like it's coming from a real user session. We also added `--js-runtimes node` and `--remote-components ejs:github` to handle YouTube's JS challenge system.
+**Fix:** Export your logged-in browser cookies and pass them to yt-dlp via `--cookies`. The request appears to come from a real user session. We also added `--js-runtimes node` and `--remote-components ejs:github` to handle YouTube's JS challenge system.
 
 ### 2. Railway's HTTP proxy times out after 5 minutes
-Railway (and most cloud platforms) drop HTTP connections that stay open longer than 5 minutes. Spleeter takes 30–90 seconds — fine — but we originally used Demucs which took 10–20 minutes. Even after switching to Spleeter, long HTTP requests are fragile.
+Railway drops HTTP connections that stay open longer than 5 minutes. Even with Spleeter's 30–60 second processing time, a single long-lived HTTP request is fragile across networks.
 
 **Fix:** Polling architecture. `POST /api/process` returns a `job_id` instantly. The job runs in the background via `asyncio.create_task()`. The frontend polls `GET /api/status/{job_id}` every 5 seconds. No long-lived HTTP connection needed.
 
-### 3. Demucs was way too slow on CPU (we picked the wrong model)
-We originally built with Demucs `mdx_extra` because it has best-in-class separation quality. On local (Apple M1), a 4-minute song took ~8 minutes. On Railway's shared CPU, it took **10–20 minutes**. Completely unusable for a web app.
+### 3. Demucs was way too slow on CPU
+We originally built with Demucs `mdx_extra` (Meta's model, best-in-class quality). On a local Apple M1, a 4-minute song took ~8 minutes. On Railway's shared CPU it took **10–20 minutes**. Completely unusable.
 
-**Fix:** Switched to Spleeter. Same 4-minute song takes ~30 seconds on the same CPU. Quality is slightly lower but more than good enough for karaoke.
+**Fix:** Switched to Spleeter. Same 4-minute song takes ~30 seconds on the same CPU. Quality is slightly lower but perfectly fine for karaoke.
 
-> **Lesson:** For a product, always validate processing speed on the actual deployment hardware before committing to a model.
+> **Lesson:** Always benchmark on your actual deployment hardware before committing to an ML model.
 
 ### 4. Spleeter tried to write model files to a root-owned directory
-During Docker build, `USER appuser` switches to a non-root user. But Spleeter's default model directory is `./pretrained_models` relative to the working directory (`/app`), which is owned by root.
+During Docker build, `USER appuser` switches to a non-root user. Spleeter's default model path is `./pretrained_models` relative to the working directory (`/app`), which is owned by root.
 
-**Fix:** Set `ENV MODEL_PATH=/home/appuser/pretrained_models` so Spleeter writes to the user's home directory, which they own.
+**Fix:** Set `ENV MODEL_PATH=/home/appuser/pretrained_models` so Spleeter writes to the user's home directory.
 
-### 5. yt-dlp JS runtime: Deno vs Node.js
-yt-dlp needs a JavaScript runtime to solve YouTube's bot-detection challenges. We first tried Deno (downloaded from GitHub at build time), which failed on HuggingFace because they block outbound network during builds. We then tried `--js-runtimes nodejs` which is the wrong flag name.
+### 5. yt-dlp JS runtime: wrong flag name
+yt-dlp needs a JavaScript runtime to solve YouTube's bot-detection challenges. We first tried Deno (downloaded from GitHub at build time — fails on HuggingFace because they block outbound network during builds). We then used `--js-runtimes nodejs` which is an invalid flag name.
 
 **Fix:** Install `nodejs` via `apt-get`, use `--js-runtimes node` (not `nodejs`).
 
-### 6. `$PORT` wasn't expanding in Railway
-Our Dockerfile originally used the JSON `CMD` form (`["uvicorn", ..., "--port", "$PORT"]`). JSON exec form doesn't go through a shell, so `$PORT` was passed as a literal string.
+### 6. `$PORT` not expanding in Railway
+Our Dockerfile originally used the JSON array `CMD` form (`["uvicorn", ..., "--port", "$PORT"]`). JSON exec form bypasses the shell, so `$PORT` was passed as a literal string and uvicorn rejected it.
 
-**Fix:** Use shell form: `CMD ["sh", "-c", "uvicorn main:app ... --port ${PORT:-8000}"]`.
+**Fix:** Shell form: `CMD ["sh", "-c", "uvicorn main:app ... --port ${PORT:-8000}"]`.
 
 ### 7. HuggingFace Spaces blocks network during Docker build
-We originally deployed to HuggingFace Spaces (free tier). Pre-downloading the Demucs model during build failed because HF blocks all outbound network connections during the build step.
+We originally deployed to HuggingFace Spaces (free tier). Pre-downloading the model during build failed silently because HF blocks all outbound network during the build step.
 
 **Fix:** Moved to Railway, which allows network access during build.
 
@@ -205,26 +270,26 @@ We originally deployed to HuggingFace Spaces (free tier). Pre-downloading the De
 
 | What | Why it was a mistake | Better approach |
 |---|---|---|
-| Starting with Demucs | 10–20 min processing time, unusable on CPU | Start with Spleeter; upgrade to Demucs only if you have GPU |
-| Single-request architecture | Timed out on Railway's 5-min proxy limit | Start with polling from day one for any job > 30s |
+| Starting with Demucs | 10–20 min processing time — completely unusable on CPU | Start with Spleeter; only upgrade to Demucs if you have GPU |
+| Single long-lived HTTP request | Timed out on Railway's 5-min proxy limit | Start with polling from day one for any job > 30s |
 | Deploying to HuggingFace first | No network during build, free tier too slow | Go straight to Railway or any platform that allows build-time network access |
-| In-memory job store | Jobs lost on restart, no persistence | Use Redis or a lightweight DB (SQLite) even for a prototype |
-| No job queue | Only 1 concurrent job, others wait up to 30 minutes | Use a proper queue (Celery + Redis, or RQ) if scaling beyond 1 worker |
+| In-memory job store | Jobs lost on restart; doesn't scale past 1 replica | Use Redis or SQLite even for a prototype |
+| No job queue | Only 1 concurrent job; others queue up | Use a proper task queue (Celery + Redis, or RQ) before scaling beyond 1 worker |
 
 ---
 
 ## Limitations
 
-- **YouTube only** — no Spotify, SoundCloud, etc.
-- **Max song length: 10 minutes** — longer songs are rejected upfront
-- **1 song at a time** — a semaphore limits concurrent jobs to 1 (CPU constraint)
+- **YouTube only** — no Spotify, SoundCloud, or other sources
+- **Max song length: 10 minutes** — longer videos are rejected before downloading
+- **1 song at a time** — CPU and memory can only handle one Spleeter job concurrently
 - **Rate limit** — 3 requests per IP per minute
-- **Cookies expire** — YouTube cookies need to be refreshed periodically (every few weeks)
-- **Quality varies** — Spleeter works best on pop/rock with clear vocal separation; may struggle with heavily layered productions
-- **No persistence** — processed files are deleted after 1 hour; job state is lost on restart
+- **Cookies require maintenance** — YouTube cookies expire and need to be refreshed periodically
+- **Quality varies** — Spleeter works best on pop/rock with clear vocal separation; may struggle with heavily layered or live recordings
+- **No persistence** — processed files are deleted after 1 hour; job state is lost on container restart
 
 ---
 
 ## License
 
-MIT
+MIT — see [LICENSE](./LICENSE)
