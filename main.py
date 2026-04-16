@@ -185,7 +185,7 @@ async def process_video(req: ProcessRequest, request: Request):
             logging.info("[%s] Download complete (%.1fMB)", job_id, actual_input.stat().st_size / 1e6)
 
             # Step 2: Vocal separation
-            demucs_timeout = int(max(300, min(song_duration * 3, 1200))) if song_duration else 900
+            demucs_timeout = int(max(600, min(song_duration * 5, 1800))) if song_duration else 1200
             logging.info("[%s] Starting vocal separation (timeout: %ds)...", job_id, demucs_timeout)
             t0 = time.time()
             demucs = await asyncio.to_thread(
