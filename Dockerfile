@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.10-slim
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -11,16 +11,10 @@ RUN useradd --create-home appuser
 
 WORKDIR /app
 
-# Install CPU-only PyTorch (small footprint, no CUDA)
-RUN pip install --no-cache-dir \
-    torch==2.2.0+cpu \
-    torchaudio==2.2.0+cpu \
-    --index-url https://download.pytorch.org/whl/cpu
+# Install Spleeter (pulls in TensorFlow automatically)
+RUN pip install --no-cache-dir spleeter
 
-# Install demucs and its deps separately (pin numpy<2 for demucs 4.0.1 compatibility)
-RUN pip install --no-cache-dir "numpy<2" demucs==4.0.1
-
-# Install web framework
+# Install web framework + YouTube downloader
 RUN pip install --no-cache-dir \
     fastapi==0.115.0 \
     uvicorn==0.30.6 \
@@ -35,9 +29,11 @@ RUN mkdir -p /tmp/karaoke_work && chown appuser:appuser /tmp/karaoke_work
 
 USER appuser
 
-# Pre-download the Demucs model so it's baked into the image (no cold start delay)
-RUN python -c "from demucs.pretrained import get_model; get_model('mdx_extra')"
+# Pre-download Spleeter 2stems model so it's baked into the image
+RUN ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t 1 /tmp/test.wav && \
+    spleeter separate -p spleeter:2stems -o /tmp/sp_test /tmp/test.wav && \
+    rm -rf /tmp/test.wav /tmp/sp_test
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --timeout-keep-alive 1850"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --timeout-keep-alive 300"]

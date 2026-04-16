@@ -165,58 +165,43 @@ async def _run_job(job_id: str, url: str):
             actual_input = actual_files[0]
             logging.info("[%s] Download complete (%.1fMB)", job_id, actual_input.stat().st_size / 1e6)
 
-            # Step 2: Vocal separation
-            demucs_timeout = int(max(900, min(song_duration * 15, 5400))) if song_duration else 5400
-            logging.info("[%s] Starting vocal separation (timeout: %ds)...", job_id, demucs_timeout)
+            # Step 2: Vocal separation with Spleeter
+            spleeter_out = job_dir / "spleeter_out"
+            spleeter_out.mkdir(exist_ok=True)
+            spleeter_timeout = int(max(120, min(song_duration * 3, 600))) if song_duration else 600
+            logging.info("[%s] Starting vocal separation (timeout: %ds)...", job_id, spleeter_timeout)
             _jobs[job_id]["step"] = "separating"
             t0 = time.time()
-            demucs = await asyncio.to_thread(
+            sep = await asyncio.to_thread(
                 subprocess.run,
                 [
-                    "python", "-m", "demucs",
-                    "-n", "mdx_extra",
-                    "--two-stems", "vocals",
-                    "-o", str(job_dir / "output"),
-                    "--mp3",
+                    "spleeter", "separate",
+                    "-p", "spleeter:2stems",
+                    "-c", "mp3",
+                    "-o", str(spleeter_out),
                     str(actual_input),
                 ],
-                capture_output=True, text=True, timeout=demucs_timeout,
+                capture_output=True, text=True, timeout=spleeter_timeout,
             )
             elapsed = time.time() - t0
 
-            if demucs.returncode != 0:
-                combined = ((demucs.stderr or "") + (demucs.stdout or ""))
+            if sep.returncode != 0:
+                combined = ((sep.stderr or "") + (sep.stdout or ""))
                 combined = combined.replace(str(WORK_DIR), "[workdir]")
-                logging.error("[%s] Demucs failed after %.1fs: %s", job_id, elapsed, combined)
+                logging.error("[%s] Spleeter failed after %.1fs: %s", job_id, elapsed, combined)
                 _jobs[job_id] = {"status": "error", "error": f"Vocal separation failed: {combined[-500:]}"}
                 return
 
             logging.info("[%s] Vocal separation complete in %.1fs", job_id, elapsed)
 
             # Step 3: Find output
-            output_dir = job_dir / "output" / "mdx_extra"
-            if not output_dir.exists():
-                _jobs[job_id] = {"status": "error", "error": "Output directory not found."}
-                return
-
-            no_vocals = None
-            for d in output_dir.iterdir():
-                if not d.is_dir():
-                    continue
-                for ext in ("mp3", "wav"):
-                    candidate = d / f"no_vocals.{ext}"
-                    if candidate.exists():
-                        no_vocals = candidate
-                        break
-                if no_vocals:
-                    break
-
-            if no_vocals is None:
+            accompaniment = spleeter_out / actual_input.stem / "accompaniment.mp3"
+            if not accompaniment.exists():
                 _jobs[job_id] = {"status": "error", "error": "Output file not found."}
                 return
 
-            serve_name = f"{job_id}_karaoke{no_vocals.suffix}"
-            shutil.copy2(no_vocals, WORK_DIR / serve_name)
+            serve_name = f"{job_id}_karaoke.mp3"
+            shutil.copy2(accompaniment, WORK_DIR / serve_name)
             logging.info("[%s] Job complete. Serving: %s", job_id, serve_name)
             _jobs[job_id] = {"status": "complete", "audio_url": f"/api/audio/{serve_name}"}
 
