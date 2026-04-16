@@ -29,6 +29,9 @@ RUN mkdir -p /tmp/karaoke_work && chown appuser:appuser /tmp/karaoke_work
 
 USER appuser
 
+# Tell Spleeter to store models in the user's home dir (writable by appuser)
+ENV MODEL_PATH=/home/appuser/pretrained_models
+
 # Pre-download Spleeter 2stems model so it's baked into the image
 RUN ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t 1 /tmp/test.wav && \
     spleeter separate -p spleeter:2stems -o /tmp/sp_test /tmp/test.wav && \
