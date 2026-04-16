@@ -12,7 +12,7 @@ WORKDIR /app
 # Regular PyTorch (has ARM64 support, unlike +cpu wheels)
 RUN pip install --no-cache-dir torch==2.2.0 torchaudio==2.2.0
 
-RUN pip install --no-cache-dir "numpy<2" demucs==4.0.1 diffq
+RUN pip install --no-cache-dir "numpy<2" demucs==4.0.1
 
 RUN pip install --no-cache-dir \
     fastapi==0.115.0 \

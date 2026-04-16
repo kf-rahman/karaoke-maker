@@ -192,7 +192,7 @@ async def process_video(req: ProcessRequest, request: Request):
                 subprocess.run,
                 [
                     "python", "-m", "demucs",
-                    "-n", "mdx_extra_q",
+                    "-n", "mdx_extra",
                     "--two-stems", "vocals",
                     "-o", str(job_dir / "output"),
                     "--mp3",
@@ -211,7 +211,7 @@ async def process_video(req: ProcessRequest, request: Request):
             logging.info("[%s] Vocal separation complete in %.1fs", job_id, elapsed)
 
             # Step 3: Find output file
-            output_dir = job_dir / "output" / "mdx_extra_q"
+            output_dir = job_dir / "output" / "mdx_extra"
             if not output_dir.exists():
                 raise HTTPException(status_code=500, detail="Output directory not found")
 
