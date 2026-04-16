@@ -4,6 +4,8 @@ Paste a YouTube link, get back an instrumental track you can sing over. Vocals a
 
 **Live demo:** [karaoke-maker-production.up.railway.app](https://karaoke-maker-production.up.railway.app)
 
+![Karaoke Maker UI](https://raw.githubusercontent.com/kf-rahman/karaoke-maker/main/static/screenshot.png)
+
 > **Legal notice:** This tool is intended for personal and educational use. Downloading audio from YouTube may be subject to [YouTube's Terms of Service](https://www.youtube.com/t/terms). You are responsible for ensuring your use complies with applicable laws and terms.
 
 ---
@@ -19,9 +21,12 @@ Paste a YouTube link, get back an instrumental track you can sing over. Vocals a
 - [Deploying to Railway](#deploying-to-railway)
 - [Configuration](#configuration)
 - [Operational Notes](#operational-notes)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
 - [Roadblocks We Hit (and How We Solved Them)](#roadblocks-we-hit-and-how-we-solved-them)
 - [What We'd Do Differently](#what-wed-do-differently)
 - [Limitations](#limitations)
+- [Acknowledgements](#acknowledgements)
 
 ---
 
@@ -225,6 +230,113 @@ Processed MP3 files are stored in `/tmp/karaoke_work/` and deleted automatically
 
 ---
 
+## Troubleshooting
+
+### Downloads failing with a 403 error
+YouTube is blocking the request. Your cookies are either missing or expired.
+
+**Fix:** Re-export cookies from your browser and update the `YOUTUBE_COOKIES` environment variable in Railway. See [Getting YouTube Cookies](#getting-youtube-cookies).
+
+---
+
+### "Processing timed out. Try a shorter song."
+The Spleeter process took longer than the allowed timeout. This can happen if:
+- The song is very long (close to the 10-minute limit)
+- The server is under heavy load
+
+**Fix:** Try again with a shorter song. If it consistently times out on short songs, check the Railway **Metrics** tab — if memory is spiking above 4 GB, the process may be getting killed by the OS before timing out cleanly.
+
+---
+
+### "Failed to download audio"
+Usually one of three causes:
+
+| Symptom in the error message | Cause | Fix |
+|---|---|---|
+| `403` / `Sign in to confirm` | Missing or expired cookies | Re-export cookies and update `YOUTUBE_COOKIES` |
+| `Video unavailable` | Region-locked or private video | Try a different video |
+| `File size limit exceeded` | Audio file larger than 50 MB | Try a shorter/lower-quality video |
+
+---
+
+### "Output file not found" after separation
+Spleeter ran but didn't produce output. This usually means:
+- The input audio was corrupted or in an unexpected format
+- Spleeter ran out of memory mid-job
+
+**Fix:** Check the Railway deployment logs for a stack trace. If you see an OOM message, your plan may need more RAM. Spleeter requires ~2–3 GB per job.
+
+---
+
+### Build fails at the Spleeter model download step
+The pre-download step runs `spleeter separate` on a silent audio file to trigger the model download. If this fails:
+
+- `PermissionError: pretrained_models` — `MODEL_PATH` env var isn't set. Ensure the Dockerfile has `ENV MODEL_PATH=/home/appuser/pretrained_models` **after** the `USER appuser` line.
+- Network error — the build runner can't reach the model CDN. Railway should always allow this; try re-triggering the build.
+
+---
+
+### The app deployed but shows a blank page
+The `static/index.html` file isn't being served. Check that the `COPY . .` step in the Dockerfile is copying the `static/` directory into `/app/static/`. Run `docker run --rm karaoke-local ls /app/static` to verify.
+
+---
+
+## Contributing
+
+Contributions are welcome. Here's how to get set up:
+
+### 1. Fork and clone
+
+```bash
+git clone https://github.com/your-username/karaoke-maker.git
+cd karaoke-maker
+```
+
+### 2. Build the local image
+
+```bash
+docker build -f Dockerfile.local -t karaoke-local .
+```
+
+This is the only setup step — all dependencies are inside Docker.
+
+### 3. Run with live reloading
+
+```bash
+docker run -p 8000:8000 \
+  -v $(pwd)/main.py:/app/main.py \
+  -v $(pwd)/static:/app/static \
+  -e YOUTUBE_COOKIES="$(cat /path/to/cookies.txt)" \
+  karaoke-local
+```
+
+Mounting `main.py` and `static/` lets you edit code on your host and see changes without rebuilding. You'll need to restart the container to pick up Python changes (uvicorn doesn't auto-reload in this setup).
+
+### 4. Making changes
+
+- **Backend logic** → `main.py`
+- **UI** → `static/index.html` (single file, no build step)
+- **Dependencies** → update both `Dockerfile` / `Dockerfile.local` and `requirements.txt`
+
+### 5. Before submitting a PR
+
+- Test your change end-to-end with a real YouTube URL
+- If you're changing the Dockerfile, test the full build locally
+- Keep PRs focused — one thing at a time
+
+### Good first issues
+
+| Area | Idea |
+|---|---|
+| Frontend | Show estimated time remaining based on song duration |
+| Backend | Add WebSocket support to replace polling |
+| Backend | Persist job state to SQLite so jobs survive restarts |
+| Backend | Support multiple concurrent jobs with a proper task queue (RQ/Celery) |
+| DevOps | Add a GitHub Actions workflow to build and test the Docker image on every PR |
+| Quality | Add support for Demucs as a higher-quality option when GPU is available |
+
+---
+
 ## Roadblocks We Hit (and How We Solved Them)
 
 ### 1. YouTube blocks server IPs
@@ -287,6 +399,16 @@ We originally deployed to HuggingFace Spaces (free tier). Pre-downloading the mo
 - **Cookies require maintenance** — YouTube cookies expire and need to be refreshed periodically
 - **Quality varies** — Spleeter works best on pop/rock with clear vocal separation; may struggle with heavily layered or live recordings
 - **No persistence** — processed files are deleted after 1 hour; job state is lost on container restart
+
+---
+
+## Acknowledgements
+
+- [Spleeter](https://github.com/deezer/spleeter) by Deezer Research — the audio separation model that makes this possible
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — YouTube audio extraction
+- [Demucs](https://github.com/facebookresearch/demucs) by Meta Research — what we started with and would recommend if you have GPU
+- [FastAPI](https://fastapi.tiangolo.com/) — the web framework
+- [FFmpeg](https://ffmpeg.org/) — audio format conversion
 
 ---
 
