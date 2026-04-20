@@ -248,6 +248,11 @@
         let isProcessing = false;
         let abortController = null;
         let progressInterval = null;
+        let currentPct = 0;
+        let targetPct = 0;
+
+        // Each step gets a ceiling it eases toward but never quite reaches
+        const STEP_TARGETS = { queued: 8, downloading: 40, separating: 88 };
 
         function handleSubmit(e) {
             e.preventDefault();
@@ -268,33 +273,42 @@
         }
 
         function startProgress() {
-            // Animate from 0% to 90% over ~3 minutes, then hold until done
-            const totalMs = 180000;
-            const startTime = Date.now();
+            currentPct = 0;
+            targetPct = STEP_TARGETS.queued;
             progressWrap.style.display = 'block';
             progressBar.style.width = '0%';
             progressLabel.textContent = '';
 
             progressInterval = setInterval(() => {
-                const elapsed = Date.now() - startTime;
-                const pct = Math.min(90, (elapsed / totalMs) * 90);
-                progressBar.style.width = pct.toFixed(1) + '%';
-                const secsElapsed = Math.floor(elapsed / 1000);
-                progressLabel.textContent = `${secsElapsed}s elapsed`;
-            }, 500);
+                // Ease toward target — fast when far, slow as it approaches
+                currentPct += (targetPct - currentPct) * 0.06;
+                progressBar.style.width = currentPct.toFixed(2) + '%';
+            }, 300);
+        }
+
+        function updateProgressStep(step) {
+            const t = STEP_TARGETS[step];
+            if (t !== undefined && t > targetPct) {
+                targetPct = t;
+            }
         }
 
         function finishProgress() {
             clearInterval(progressInterval);
+            progressInterval = null;
+            currentPct = 100;
             progressBar.style.width = '100%';
             progressLabel.textContent = 'Done!';
         }
 
         function stopProgress() {
             clearInterval(progressInterval);
+            progressInterval = null;
             progressWrap.style.display = 'none';
             progressBar.style.width = '0%';
             progressLabel.textContent = '';
+            currentPct = 0;
+            targetPct = 0;
         }
 
         async function process() {
@@ -381,8 +395,9 @@
                     } else if (pollData.status === 'error') {
                         throw new Error(pollData.error || 'Processing failed');
                     } else {
-                        // Update status message based on step
+                        // Update status message and progress based on step
                         const step = pollData.step || '';
+                        updateProgressStep(step);
                         if (step === 'downloading') {
                             statusMsg.textContent = 'Downloading audio...';
                         } else if (step === 'separating') {
