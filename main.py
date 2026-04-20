@@ -5,6 +5,9 @@ import shutil
 import subprocess
 import asyncio
 import logging
+import urllib.request
+import urllib.parse
+import json
 from pathlib import Path
 
 logging.basicConfig(
@@ -119,23 +122,29 @@ async def _run_job(job_id: str, url: str):
             return
 
         try:
-            # Step 0: Probe duration
-            logging.info("[%s] Probing video duration...", job_id)
+            # Step 0: Probe duration + title
+            logging.info("[%s] Probing video metadata...", job_id)
             probe = await asyncio.to_thread(
                 subprocess.run,
-                _yt_dlp_base_args() + ["--print", "duration", "--skip-download", url],
+                _yt_dlp_base_args() + ["--dump-json", "--skip-download", url],
                 capture_output=True, text=True, timeout=30,
             )
             song_duration: float | None = None
+            song_title: str | None = None
             if probe.returncode == 0:
                 try:
-                    song_duration = float(probe.stdout.strip())
-                    logging.info("[%s] Duration: %ds", job_id, int(song_duration))
-                    if song_duration > MAX_DURATION_SECONDS:
+                    meta = json.loads(probe.stdout.strip())
+                    song_duration = float(meta.get("duration") or 0) or None
+                    song_title = meta.get("title") or None
+                    if song_duration:
+                        logging.info("[%s] Duration: %ds, title: %s", job_id, int(song_duration), song_title)
+                    if song_duration and song_duration > MAX_DURATION_SECONDS:
                         _jobs[job_id] = {"status": "error", "error": f"Video is too long ({int(song_duration)}s). Maximum is {MAX_DURATION_SECONDS // 60} minutes."}
                         return
-                except ValueError:
+                except (ValueError, json.JSONDecodeError):
                     pass
+            if song_title:
+                _jobs[job_id]["title"] = song_title
 
             # Step 1: Download audio
             logging.info("[%s] Downloading audio...", job_id)
@@ -259,6 +268,58 @@ async def serve_audio(filename: str):
         file_path, media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+def _clean_title_for_search(title: str) -> str:
+    """Strip common YouTube noise before sending to lyrics search."""
+    # Remove parenthetical/bracketed suffixes like (Official Video), [4K], (Remastered 2011)
+    title = re.sub(r"[\(\[][^\)\]]{0,40}[\)\]]", "", title)
+    # Remove common filler words that hurt search
+    title = re.sub(r"\b(official|video|audio|lyrics|lyric|hd|hq|mv|ft\.?|feat\.?)\b", "", title, flags=re.IGNORECASE)
+    return title.strip(" -–|")
+
+
+@app.get("/api/lyrics/{job_id}")
+async def get_lyrics(job_id: str):
+    if not re.fullmatch(r"[a-f0-9]{8}", job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    title = job.get("title")
+    if not title:
+        return JSONResponse({"lyrics": None, "title": None})
+
+    query = _clean_title_for_search(title)
+    logging.info("[%s] Fetching lyrics for: %s", job_id, query)
+
+    try:
+        encoded = urllib.parse.urlencode({"q": query})
+        req = urllib.request.Request(
+            f"https://lrclib.net/api/search?{encoded}",
+            headers={"User-Agent": "karaoke-maker/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            results = json.loads(resp.read().decode())
+
+        if not results:
+            return JSONResponse({"lyrics": None, "title": title})
+
+        # Prefer results that have plain lyrics; take the first match
+        best = next((r for r in results if r.get("plainLyrics")), None)
+        if not best:
+            return JSONResponse({"lyrics": None, "title": title})
+
+        return JSONResponse({
+            "lyrics": best["plainLyrics"],
+            "title": title,
+            "matched": best.get("trackName") or best.get("title"),
+            "artist": best.get("artistName"),
+        })
+
+    except Exception as e:
+        logging.warning("[%s] Lyrics fetch failed: %s", job_id, e)
+        return JSONResponse({"lyrics": None, "title": title})
 
 
 @app.get("/api/health")
