@@ -215,7 +215,7 @@ async def _run_job(job_id: str, url: str):
             serve_name = f"{job_id}_karaoke.mp3"
             shutil.copy2(accompaniment, WORK_DIR / serve_name)
             logging.info("[%s] Job complete. Serving: %s", job_id, serve_name)
-            _jobs[job_id] = {"status": "complete", "audio_url": f"/api/audio/{serve_name}"}
+            _jobs[job_id].update({"status": "complete", "audio_url": f"/api/audio/{serve_name}"})
 
         finally:
             _job_semaphore.release()
