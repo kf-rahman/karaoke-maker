@@ -197,7 +197,10 @@ async def _run_job(job_id: str, url: str):
             if sep.returncode != 0:
                 combined = ((sep.stderr or "") + (sep.stdout or ""))
                 combined = combined.replace(str(WORK_DIR), "[workdir]")
-                logging.error("[%s] Spleeter failed after %.1fs: %s", job_id, elapsed, combined)
+                logging.error(
+                    "[%s] Spleeter failed after %.1fs (returncode=%s): %r",
+                    job_id, elapsed, sep.returncode, combined[-500:],
+                )
                 _jobs[job_id] = {"status": "error", "error": f"Vocal separation failed: {combined[-500:]}"}
                 return
 
