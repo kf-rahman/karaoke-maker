@@ -4,3 +4,4 @@ pydantic==2.9.2
 yt-dlp
 demucs
 openai-whisper
+soundfile
