@@ -320,6 +320,9 @@ async def _run_job(job_id: str, url: str):
                     combined = ((sep.stderr or "") + (sep.stdout or "")).replace(str(WORK_DIR), "[workdir]")
                     logging.error("[%s] Spleeter failed after %.1fs (returncode=%s): %r", job_id, elapsed, sep.returncode, combined[-500:])
                     spleeter_state["error"] = f"Vocal separation failed: {combined[-500:]}"
+                    # Surface the error immediately — don't wait for Whisper to
+                    # finish since without audio there's nothing to show
+                    _jobs[job_id].update({"status": "error", "error": spleeter_state["error"]})
                 else:
                     logging.info("[%s] Spleeter done in %.1fs", job_id, elapsed)
                     spleeter_state["ok"] = True
