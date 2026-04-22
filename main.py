@@ -129,14 +129,41 @@ def _clean_title_for_search(title: str) -> str:
     return title.strip(" -–|")
 
 
+def _is_non_latin(text: str) -> bool:
+    """Returns True if the majority of alphabetic characters are non-Latin."""
+    alpha_chars = [c for c in text if c.isalpha()]
+    if not alpha_chars:
+        return False
+    non_latin = sum(1 for c in alpha_chars if ord(c) > 591)  # beyond Latin Extended-B
+    return non_latin / len(alpha_chars) > 0.5
+
+
+def _transliterate(text: str) -> str:
+    """Romanize non-Latin text using unidecode for phonetic approximation."""
+    try:
+        from unidecode import unidecode
+        return unidecode(text)
+    except ImportError:
+        return text
+
+
 def _segments_to_lrc(segments: list) -> str:
-    """Convert Whisper segments to LRC timestamp format."""
+    """Convert Whisper segments to LRC timestamp format.
+    Romanizes non-Latin text so users can sing along regardless of script."""
+    raw_text = " ".join(seg["text"] for seg in segments)
+    needs_transliteration = _is_non_latin(raw_text)
+    if needs_transliteration:
+        logging.info("Non-Latin script detected — applying transliteration")
+
     lines = []
     for seg in segments:
         t = seg["start"]
         minutes = int(t // 60)
         seconds = t % 60
-        lines.append(f"[{minutes:02d}:{seconds:05.2f}] {seg['text'].strip()}")
+        text = seg["text"].strip()
+        if needs_transliteration:
+            text = _transliterate(text)
+        lines.append(f"[{minutes:02d}:{seconds:05.2f}] {text}")
     return "\n".join(lines)
 
 

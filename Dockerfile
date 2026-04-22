@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir \
     demucs \
     openai-whisper \
     soundfile \
+    unidecode \
     fastapi==0.115.0 \
     uvicorn==0.30.6 \
     pydantic==2.9.2 \
