@@ -218,6 +218,26 @@
             padding-right: 0.25rem;
         }
 
+        /* Synced mode — each line is its own element */
+        .lyrics-body.synced {
+            white-space: normal;
+        }
+
+        .lyric-line {
+            display: block;
+            padding: 0.15rem 0.5rem;
+            border-radius: 6px;
+            color: #aaa;
+            transition: color 0.2s, background 0.2s;
+            cursor: default;
+        }
+
+        .lyric-line.active {
+            color: #7c3aed;
+            font-weight: 600;
+            background: #f3eeff;
+        }
+
         .lyrics-meta {
             font-size: 0.78rem;
             color: #aaa;
@@ -314,23 +334,82 @@
             status.classList.remove('visible');
             audio.src = '';
             lyricsPanel.classList.remove('visible');
+            lyricsBody.classList.remove('synced');
             lyricsBody.textContent = '';
             lyricsMeta.textContent = '';
+            audio.removeEventListener('timeupdate', onTimeUpdate);
+            syncedLines = [];
+            lastActiveIdx = -1;
             stopProgress();
             urlInput.focus();
+        }
+
+        let syncedLines = [];   // [{ time, el }]
+        let lastActiveIdx = -1;
+
+        function parseLrc(lrc) {
+            // Parse "[mm:ss.xx] text" into [{ time (seconds), text }]
+            return lrc.split('\n')
+                .map(line => {
+                    const m = line.match(/^\[(\d{2}):(\d{2}\.\d+)\]\s*(.*)/);
+                    if (!m) return null;
+                    return { time: parseInt(m[1]) * 60 + parseFloat(m[2]), text: m[3] };
+                })
+                .filter(Boolean);
+        }
+
+        function buildSyncedLyrics(lines) {
+            lyricsBody.classList.add('synced');
+            lyricsBody.innerHTML = '';
+            syncedLines = lines.map(({ time, text }) => {
+                const el = document.createElement('span');
+                el.className = 'lyric-line';
+                el.textContent = text;
+                lyricsBody.appendChild(el);
+                return { time, el };
+            });
+            lastActiveIdx = -1;
+            audio.addEventListener('timeupdate', onTimeUpdate);
+        }
+
+        function onTimeUpdate() {
+            const t = audio.currentTime;
+            let idx = -1;
+            for (let i = syncedLines.length - 1; i >= 0; i--) {
+                if (t >= syncedLines[i].time) { idx = i; break; }
+            }
+            if (idx === lastActiveIdx) return;
+            if (lastActiveIdx >= 0) syncedLines[lastActiveIdx].el.classList.remove('active');
+            if (idx >= 0) {
+                const el = syncedLines[idx].el;
+                el.classList.add('active');
+                // Scroll active line to center of the panel
+                el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            }
+            lastActiveIdx = idx;
         }
 
         async function fetchLyrics(jobId) {
             try {
                 const res = await fetch(`/api/lyrics/${jobId}`);
                 const data = await res.json();
-                if (data.lyrics) {
-                    lyricsBody.textContent = data.lyrics;
-                    if (data.artist && data.matched) {
-                        lyricsMeta.textContent = `${data.artist} — ${data.matched}`;
+                if (!data.lyrics) return;
+
+                if (data.lyrics_synced) {
+                    const lines = parseLrc(data.lyrics);
+                    if (lines.length) {
+                        buildSyncedLyrics(lines);
+                    } else {
+                        lyricsBody.textContent = data.lyrics;
                     }
-                    lyricsPanel.classList.add('visible');
+                } else {
+                    lyricsBody.textContent = data.lyrics;
                 }
+
+                if (data.artist && data.matched) {
+                    lyricsMeta.textContent = `${data.artist} — ${data.matched}`;
+                }
+                lyricsPanel.classList.add('visible');
             } catch {
                 // silently skip — lyrics are best-effort
             }
