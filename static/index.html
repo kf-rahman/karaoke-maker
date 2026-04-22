@@ -467,7 +467,9 @@
                             statusMsg.textContent = 'Downloading audio...';
                         } else if (step === 'separating') {
                             statusMsg.textContent = 'Removing vocals (this takes a few minutes)...';
-                        } else if (step === 'transcribing') {\n                            statusMsg.textContent = 'Transcribing lyrics...';\n                        } else if (step === 'queued') {
+                        } else if (step === 'transcribing') {
+                            statusMsg.textContent = 'Transcribing lyrics...';
+                        } else if (step === 'queued') {
                             statusMsg.textContent = 'Queued, waiting for processing slot...';
                         }
                     }
