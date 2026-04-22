@@ -181,7 +181,9 @@ def _run_demucs_separation(audio_path: Path, output_path: Path) -> None:
     """Load HTDemucs, separate vocals, write accompaniment MP3, then free RAM."""
     import gc
     import torch
-    import torchaudio
+    import soundfile as sf
+    import numpy as np
+    import julius
     from demucs.pretrained import get_model
     from demucs.apply import apply_model
 
@@ -191,9 +193,12 @@ def _run_demucs_separation(audio_path: Path, output_path: Path) -> None:
     samplerate = model.samplerate
     audio_channels = model.audio_channels
 
-    wav, sr = torchaudio.load(str(audio_path))
+    # Use soundfile instead of torchaudio to avoid torchcodec backend issues
+    data, sr = sf.read(str(audio_path), always_2d=True)  # [time, channels]
+    wav = torch.tensor(data.T, dtype=torch.float32)       # [channels, time]
+
     if sr != samplerate:
-        wav = torchaudio.functional.resample(wav, sr, samplerate)
+        wav = julius.resample_frac(wav, sr, samplerate)
     if wav.shape[0] == 1:
         wav = wav.repeat(audio_channels, 1)
     elif wav.shape[0] > audio_channels:
@@ -207,13 +212,14 @@ def _run_demucs_separation(audio_path: Path, output_path: Path) -> None:
     accompaniment = sources[0, :-1].sum(dim=0).cpu()  # sum all non-vocal stems
 
     # Free Demucs from RAM before Whisper runs
-    del model, sources, wav
+    del model, sources, wav, data
     gc.collect()
     logging.info("HTDemucs freed from RAM")
 
-    # Save as temp WAV then encode to MP3 via ffmpeg
+    # Write accompaniment as MP3 via ffmpeg (soundfile doesn't write MP3)
+    accompaniment_np = accompaniment.numpy().T  # [time, channels]
     tmp_wav = output_path.with_suffix(".tmp.wav")
-    torchaudio.save(str(tmp_wav), accompaniment, sample_rate=samplerate)
+    sf.write(str(tmp_wav), accompaniment_np, samplerate)
     subprocess.run(
         ["ffmpeg", "-i", str(tmp_wav), "-q:a", "2", str(output_path), "-y"],
         check=True, capture_output=True,
