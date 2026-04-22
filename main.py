@@ -68,6 +68,8 @@ _YT_RE = re.compile(
 
 # ---------------------------------------------------------------------------
 # Whisper model — loaded once at startup, reused across jobs
+# Demucs is NOT pre-loaded — it loads per-job, separates, then is freed
+# before Whisper runs so they never share RAM simultaneously
 # ---------------------------------------------------------------------------
 _whisper_model = None
 
@@ -76,7 +78,7 @@ def _load_whisper_model():
     global _whisper_model
     try:
         import whisper
-        logging.info("Loading Whisper medium model...")
+        logging.info("Loading Whisper small model...")
         _whisper_model = whisper.load_model("small")
         logging.info("Whisper model ready.")
     except Exception:
@@ -173,6 +175,50 @@ async def _fetch_lrclib(title: str) -> dict | None:
     except Exception as e:
         logging.warning("lrclib fetch failed: %s", e)
         return None
+
+
+def _run_demucs_separation(audio_path: Path, output_path: Path) -> None:
+    """Load HTDemucs, separate vocals, write accompaniment MP3, then free RAM."""
+    import gc
+    import torch
+    import torchaudio
+    from demucs.pretrained import get_model
+    from demucs.apply import apply_model
+
+    logging.info("Loading HTDemucs model...")
+    model = get_model("htdemucs")
+    model.eval()
+    samplerate = model.samplerate
+    audio_channels = model.audio_channels
+
+    wav, sr = torchaudio.load(str(audio_path))
+    if sr != samplerate:
+        wav = torchaudio.functional.resample(wav, sr, samplerate)
+    if wav.shape[0] == 1:
+        wav = wav.repeat(audio_channels, 1)
+    elif wav.shape[0] > audio_channels:
+        wav = wav[:audio_channels]
+    wav = wav.unsqueeze(0)  # [1, channels, time]
+
+    logging.info("Running HTDemucs separation...")
+    with torch.inference_mode():
+        sources = apply_model(model, wav, progress=False)
+    # sources: [1, 4, channels, time] — drums, bass, other, vocals (last)
+    accompaniment = sources[0, :-1].sum(dim=0).cpu()  # sum all non-vocal stems
+
+    # Free Demucs from RAM before Whisper runs
+    del model, sources, wav
+    gc.collect()
+    logging.info("HTDemucs freed from RAM")
+
+    # Save as temp WAV then encode to MP3 via ffmpeg
+    tmp_wav = output_path.with_suffix(".tmp.wav")
+    torchaudio.save(str(tmp_wav), accompaniment, sample_rate=samplerate)
+    subprocess.run(
+        ["ffmpeg", "-i", str(tmp_wav), "-q:a", "2", str(output_path), "-y"],
+        check=True, capture_output=True,
+    )
+    tmp_wav.unlink(missing_ok=True)
 
 
 def _run_whisper(audio_path: Path) -> dict | None:
@@ -288,72 +334,49 @@ async def _run_job(job_id: str, url: str):
                     logging.info("[%s] lrclib miss — Whisper will transcribe", job_id)
 
             # ------------------------------------------------------------------
-            # Step 2: Spleeter + Whisper in parallel
-            #   Both read actual_input independently
-            #   Whisper only runs when lrclib found nothing
+            # Step 2: Demucs separation
+            #   Loads model, separates, then explicitly frees RAM before
+            #   Whisper runs — they never coexist in memory
             # ------------------------------------------------------------------
-            spleeter_out = job_dir / "spleeter_out"
-            spleeter_out.mkdir(exist_ok=True)
-            spleeter_timeout = int(max(120, min(song_duration * 3, 600))) if song_duration else 600
+            demucs_timeout = int(max(180, min(song_duration * 4, 700))) if song_duration else 700
+            serve_name = f"{job_id}_karaoke.mp3"
+            output_path = WORK_DIR / serve_name
 
-            logging.info("[%s] Starting separation + transcription (timeout: %ds)...", job_id, spleeter_timeout)
+            logging.info("[%s] Starting Demucs separation (timeout: %ds)...", job_id, demucs_timeout)
             _jobs[job_id]["step"] = "separating"
 
-            spleeter_state: dict = {}
-            whisper_state: dict = {}
-
-            async def run_spleeter():
-                t0 = time.time()
-                sep = await asyncio.to_thread(
-                    subprocess.run,
-                    [
-                        "spleeter", "separate",
-                        "-p", "spleeter:2stems",
-                        "-c", "mp3",
-                        "-o", str(spleeter_out),
-                        str(actual_input),
-                    ],
-                    capture_output=True, text=True, timeout=spleeter_timeout,
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(_run_demucs_separation, actual_input, output_path),
+                    timeout=demucs_timeout,
                 )
-                elapsed = time.time() - t0
-                if sep.returncode != 0:
-                    combined = ((sep.stderr or "") + (sep.stdout or "")).replace(str(WORK_DIR), "[workdir]")
-                    logging.error("[%s] Spleeter failed after %.1fs (returncode=%s): %r", job_id, elapsed, sep.returncode, combined[-500:])
-                    spleeter_state["error"] = f"Vocal separation failed: {combined[-500:]}"
-                    # Surface the error immediately — don't wait for Whisper to
-                    # finish since without audio there's nothing to show
-                    _jobs[job_id].update({"status": "error", "error": spleeter_state["error"]})
-                else:
-                    logging.info("[%s] Spleeter done in %.1fs", job_id, elapsed)
-                    spleeter_state["ok"] = True
-
-            async def run_whisper():
-                if lrclib_result or _whisper_model is None:
-                    return
-                result = await asyncio.to_thread(_run_whisper, actual_input)
-                if result:
-                    whisper_state.update(result)
-
-            await asyncio.gather(run_spleeter(), run_whisper())
-
-            # ------------------------------------------------------------------
-            # Step 3: Finish up
-            # ------------------------------------------------------------------
-            if spleeter_state.get("error"):
-                _jobs[job_id].update({"status": "error", "error": spleeter_state["error"]})
+            except asyncio.TimeoutError:
+                logging.error("[%s] Demucs timed out", job_id)
+                _jobs[job_id].update({"status": "error", "error": "Processing timed out. Try a shorter song."})
+                return
+            except Exception as e:
+                logging.error("[%s] Demucs failed: %s", job_id, e)
+                _jobs[job_id].update({"status": "error", "error": f"Vocal separation failed: {e}"})
                 return
 
-            accompaniment = spleeter_out / actual_input.stem / "accompaniment.mp3"
-            if not accompaniment.exists():
-                _jobs[job_id] = {"status": "error", "error": "Output file not found."}
+            if not output_path.exists():
+                _jobs[job_id].update({"status": "error", "error": "Output file not found."})
                 return
 
-            if whisper_state.get("lyrics"):
-                logging.info("[%s] Whisper lyrics stored", job_id)
-                _jobs[job_id].update(whisper_state)
+            logging.info("[%s] Separation complete", job_id)
 
-            serve_name = f"{job_id}_karaoke.mp3"
-            shutil.copy2(accompaniment, WORK_DIR / serve_name)
+            # ------------------------------------------------------------------
+            # Step 3: Whisper transcription (sequential — Demucs RAM is free)
+            #   Only runs when lrclib found nothing
+            # ------------------------------------------------------------------
+            if not lrclib_result and _whisper_model is not None:
+                logging.info("[%s] Starting Whisper transcription...", job_id)
+                _jobs[job_id]["step"] = "transcribing"
+                whisper_result = await asyncio.to_thread(_run_whisper, actual_input)
+                if whisper_result:
+                    logging.info("[%s] Whisper lyrics stored", job_id)
+                    _jobs[job_id].update(whisper_result)
+
             logging.info("[%s] Job complete. Serving: %s", job_id, serve_name)
             _jobs[job_id].update({"status": "complete", "audio_url": f"/api/audio/{serve_name}"})
 
