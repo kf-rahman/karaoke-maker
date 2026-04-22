@@ -77,7 +77,7 @@ def _load_whisper_model():
     try:
         import whisper
         logging.info("Loading Whisper medium model...")
-        _whisper_model = whisper.load_model("medium")
+        _whisper_model = whisper.load_model("small")
         logging.info("Whisper model ready.")
     except Exception:
         logging.exception("Failed to load Whisper model — transcription fallback disabled.")

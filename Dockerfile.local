@@ -32,7 +32,7 @@ ENV MODEL_PATH=/home/appuser/pretrained_models
 # Pre-download Spleeter and Whisper models so they're baked into the image
 RUN ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t 1 /tmp/test.wav && \
     spleeter separate -p spleeter:2stems -o /tmp/sp_test /tmp/test.wav && \
-    python3 -c "import whisper; whisper.load_model('medium')" && \
+    python3 -c "import whisper; whisper.load_model('small')" && \
     rm -rf /tmp/test.wav /tmp/sp_test
 
 EXPOSE 8000
