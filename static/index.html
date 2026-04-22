@@ -188,6 +188,42 @@
             background: #d4d4d4;
         }
 
+        .lyrics-panel {
+            display: none;
+            margin-top: 1.5rem;
+            border-top: 1px solid #e5e5e5;
+            padding-top: 1.25rem;
+        }
+
+        .lyrics-panel.visible {
+            display: block;
+        }
+
+        .lyrics-heading {
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 0.75rem;
+        }
+
+        .lyrics-body {
+            font-size: 0.92rem;
+            line-height: 1.75;
+            color: #333;
+            white-space: pre-wrap;
+            max-height: 320px;
+            overflow-y: auto;
+            padding-right: 0.25rem;
+        }
+
+        .lyrics-meta {
+            font-size: 0.78rem;
+            color: #aaa;
+            margin-top: 0.5rem;
+        }
+
         .sr-only {
             position: absolute;
             width: 1px;
@@ -227,6 +263,12 @@
             <a class="download-link" id="downloadLink" href="#" download>Download karaoke track</a>
         </div>
 
+        <div class="lyrics-panel" id="lyricsPanel">
+            <p class="lyrics-heading">Lyrics</p>
+            <div class="lyrics-body" id="lyricsBody"></div>
+            <p class="lyrics-meta" id="lyricsMeta"></p>
+        </div>
+
         <div class="actions" id="actions">
             <button type="button" onclick="resetForm()">Process another song</button>
         </div>
@@ -244,6 +286,9 @@
         const audio = document.getElementById('audio');
         const downloadLink = document.getElementById('downloadLink');
         const actions = document.getElementById('actions');
+        const lyricsPanel = document.getElementById('lyricsPanel');
+        const lyricsBody = document.getElementById('lyricsBody');
+        const lyricsMeta = document.getElementById('lyricsMeta');
 
         let isProcessing = false;
         let abortController = null;
@@ -268,8 +313,27 @@
             actions.classList.remove('visible');
             status.classList.remove('visible');
             audio.src = '';
+            lyricsPanel.classList.remove('visible');
+            lyricsBody.textContent = '';
+            lyricsMeta.textContent = '';
             stopProgress();
             urlInput.focus();
+        }
+
+        async function fetchLyrics(jobId) {
+            try {
+                const res = await fetch(`/api/lyrics/${jobId}`);
+                const data = await res.json();
+                if (data.lyrics) {
+                    lyricsBody.textContent = data.lyrics;
+                    if (data.artist && data.matched) {
+                        lyricsMeta.textContent = `${data.artist} — ${data.matched}`;
+                    }
+                    lyricsPanel.classList.add('visible');
+                }
+            } catch {
+                // silently skip — lyrics are best-effort
+            }
         }
 
         function startProgress() {
@@ -391,6 +455,7 @@
                         downloadLink.href = pollData.audio_url;
                         player.classList.add('visible');
                         actions.classList.add('visible');
+                        fetchLyrics(jobId);
                         break;
                     } else if (pollData.status === 'error') {
                         throw new Error(pollData.error || 'Processing failed');
