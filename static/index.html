@@ -297,7 +297,7 @@
         let targetPct = 0;
 
         // Each step gets a ceiling it eases toward but never quite reaches
-        const STEP_TARGETS = { queued: 8, downloading: 40, separating: 88 };
+        const STEP_TARGETS = { queued: 8, downloading: 40, separating: 80, transcribing: 92 };
 
         function handleSubmit(e) {
             e.preventDefault();
@@ -467,7 +467,7 @@
                             statusMsg.textContent = 'Downloading audio...';
                         } else if (step === 'separating') {
                             statusMsg.textContent = 'Removing vocals (this takes a few minutes)...';
-                        } else if (step === 'queued') {
+                        } else if (step === 'transcribing') {\n                            statusMsg.textContent = 'Transcribing lyrics...';\n                        } else if (step === 'queued') {
                             statusMsg.textContent = 'Queued, waiting for processing slot...';
                         }
                     }
