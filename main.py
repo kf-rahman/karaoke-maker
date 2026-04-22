@@ -51,7 +51,7 @@ MAX_CONCURRENT_JOBS = 1
 _job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
 # ---------------------------------------------------------------------------
-# Job state store  {job_id -> {status, audio_url, error, started_at}}
+# Job state store  {job_id -> {status, audio_url, error, started_at, ...}}
 # ---------------------------------------------------------------------------
 _jobs: dict[str, dict] = {}
 
@@ -65,6 +65,24 @@ MAX_DURATION_SECONDS = 600
 _YT_RE = re.compile(
     r"^https?://(www\.)?(youtube\.com/watch\?v=[\w\-]{11}|youtu\.be/[\w\-]{11}|youtube\.com/shorts/[\w\-]{11})"
 )
+
+# ---------------------------------------------------------------------------
+# Whisper model — loaded once at startup, reused across jobs
+# Demucs is NOT pre-loaded — it loads per-job, separates, then is freed
+# before Whisper runs so they never share RAM simultaneously
+# ---------------------------------------------------------------------------
+_whisper_model = None
+
+
+def _load_whisper_model():
+    global _whisper_model
+    try:
+        import whisper
+        logging.info("Loading Whisper small model...")
+        _whisper_model = whisper.load_model("small")
+        logging.info("Whisper model ready.")
+    except Exception:
+        logging.exception("Failed to load Whisper model — transcription fallback disabled.")
 
 
 def _yt_dlp_base_args() -> list[str]:
@@ -105,6 +123,133 @@ def _check_rate_limit(client_ip: str) -> None:
     _rate_limit_store[client_ip].append(now)
 
 
+def _clean_title_for_search(title: str) -> str:
+    title = re.sub(r"[\(\[][^\)\]]{0,40}[\)\]]", "", title)
+    title = re.sub(r"\b(official|video|audio|lyrics|lyric|hd|hq|mv|ft\.?|feat\.?)\b", "", title, flags=re.IGNORECASE)
+    return title.strip(" -–|")
+
+
+def _segments_to_lrc(segments: list) -> str:
+    """Convert Whisper segments to LRC timestamp format."""
+    lines = []
+    for seg in segments:
+        t = seg["start"]
+        minutes = int(t // 60)
+        seconds = t % 60
+        lines.append(f"[{minutes:02d}:{seconds:05.2f}] {seg['text'].strip()}")
+    return "\n".join(lines)
+
+
+async def _fetch_lrclib(title: str) -> dict | None:
+    """Search lrclib. Prefers synced lyrics. Returns dict or None."""
+    query = _clean_title_for_search(title)
+    logging.info("lrclib search: %r", query)
+
+    def _do_request():
+        encoded = urllib.parse.urlencode({"q": query})
+        req = urllib.request.Request(
+            f"https://lrclib.net/api/search?{encoded}",
+            headers={"User-Agent": "karaoke-maker/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode())
+
+    try:
+        results = await asyncio.to_thread(_do_request)
+        if not results:
+            return None
+        best = (
+            next((r for r in results if r.get("syncedLyrics")), None) or
+            next((r for r in results if r.get("plainLyrics")), None)
+        )
+        if not best:
+            return None
+        synced = bool(best.get("syncedLyrics"))
+        return {
+            "lyrics": best["syncedLyrics"] if synced else best["plainLyrics"],
+            "lyrics_synced": synced,
+            "lyrics_source": "lrclib",
+            "lyrics_artist": best.get("artistName"),
+            "lyrics_matched": best.get("trackName"),
+        }
+    except Exception as e:
+        logging.warning("lrclib fetch failed: %s", e)
+        return None
+
+
+def _run_demucs_separation(audio_path: Path, output_path: Path) -> None:
+    """Load HTDemucs, separate vocals, write accompaniment MP3, then free RAM."""
+    import gc
+    import torch
+    import soundfile as sf
+    import numpy as np
+    import julius
+    from demucs.pretrained import get_model
+    from demucs.apply import apply_model
+
+    logging.info("Loading HTDemucs model...")
+    model = get_model("htdemucs")
+    model.eval()
+    samplerate = model.samplerate
+    audio_channels = model.audio_channels
+
+    # Use soundfile instead of torchaudio to avoid torchcodec backend issues
+    data, sr = sf.read(str(audio_path), always_2d=True)  # [time, channels]
+    wav = torch.tensor(data.T, dtype=torch.float32)       # [channels, time]
+
+    if sr != samplerate:
+        wav = julius.resample_frac(wav, sr, samplerate)
+    if wav.shape[0] == 1:
+        wav = wav.repeat(audio_channels, 1)
+    elif wav.shape[0] > audio_channels:
+        wav = wav[:audio_channels]
+    wav = wav.unsqueeze(0)  # [1, channels, time]
+
+    logging.info("Running HTDemucs separation...")
+    with torch.inference_mode():
+        sources = apply_model(model, wav, progress=False)
+    # sources: [1, 4, channels, time] — drums, bass, other, vocals (last)
+    accompaniment = sources[0, :-1].sum(dim=0).cpu()  # sum all non-vocal stems
+
+    # Free Demucs from RAM before Whisper runs
+    del model, sources, wav, data
+    gc.collect()
+    logging.info("HTDemucs freed from RAM")
+
+    # Write accompaniment as MP3 via ffmpeg (soundfile doesn't write MP3)
+    accompaniment_np = accompaniment.numpy().T  # [time, channels]
+    tmp_wav = output_path.with_suffix(".tmp.wav")
+    sf.write(str(tmp_wav), accompaniment_np, samplerate)
+    subprocess.run(
+        ["ffmpeg", "-i", str(tmp_wav), "-q:a", "2", str(output_path), "-y"],
+        check=True, capture_output=True,
+    )
+    tmp_wav.unlink(missing_ok=True)
+
+
+def _run_whisper(audio_path: Path) -> dict | None:
+    """Blocking Whisper transcription — run via asyncio.to_thread."""
+    if _whisper_model is None:
+        return None
+    try:
+        logging.info("Whisper transcribing: %s", audio_path.name)
+        t0 = time.time()
+        result = _whisper_model.transcribe(str(audio_path), task="transcribe")
+        elapsed = time.time() - t0
+        logging.info("Whisper done in %.1fs, detected language: %s", elapsed, result.get("language"))
+        lrc = _segments_to_lrc(result["segments"])
+        return {
+            "lyrics": lrc,
+            "lyrics_synced": True,
+            "lyrics_source": "whisper",
+            "lyrics_artist": None,
+            "lyrics_matched": None,
+        }
+    except Exception:
+        logging.exception("Whisper transcription failed")
+        return None
+
+
 async def _run_job(job_id: str, url: str):
     job_dir = WORK_DIR / job_id
     job_dir.mkdir(exist_ok=True)
@@ -122,7 +267,9 @@ async def _run_job(job_id: str, url: str):
             return
 
         try:
-            # Step 0: Probe duration + title
+            # ------------------------------------------------------------------
+            # Step 0: Probe — get title + duration
+            # ------------------------------------------------------------------
             logging.info("[%s] Probing video metadata...", job_id)
             probe = await asyncio.to_thread(
                 subprocess.run,
@@ -146,7 +293,13 @@ async def _run_job(job_id: str, url: str):
             if song_title:
                 _jobs[job_id]["title"] = song_title
 
-            # Step 1: Download audio
+            # ------------------------------------------------------------------
+            # Step 1: lrclib search + download in parallel
+            #   lrclib resolves in ~1s; download takes ~10-20s
+            #   By the time download finishes we know if Whisper is needed
+            # ------------------------------------------------------------------
+            lrclib_task = asyncio.create_task(_fetch_lrclib(song_title)) if song_title else None
+
             logging.info("[%s] Downloading audio...", job_id)
             _jobs[job_id]["step"] = "downloading"
             dl = await asyncio.to_thread(
@@ -162,6 +315,8 @@ async def _run_job(job_id: str, url: str):
             )
 
             if dl.returncode != 0:
+                if lrclib_task:
+                    lrclib_task.cancel()
                 err = (dl.stderr or "")[:300].replace(str(WORK_DIR), "[workdir]")
                 logging.error("[%s] Download failed: %s", job_id, err)
                 _jobs[job_id] = {"status": "error", "error": f"Failed to download audio: {err}"}
@@ -174,46 +329,60 @@ async def _run_job(job_id: str, url: str):
             actual_input = actual_files[0]
             logging.info("[%s] Download complete (%.1fMB)", job_id, actual_input.stat().st_size / 1e6)
 
-            # Step 2: Vocal separation with Spleeter
-            spleeter_out = job_dir / "spleeter_out"
-            spleeter_out.mkdir(exist_ok=True)
-            spleeter_timeout = int(max(120, min(song_duration * 3, 600))) if song_duration else 600
-            logging.info("[%s] Starting vocal separation (timeout: %ds)...", job_id, spleeter_timeout)
-            _jobs[job_id]["step"] = "separating"
-            t0 = time.time()
-            sep = await asyncio.to_thread(
-                subprocess.run,
-                [
-                    "spleeter", "separate",
-                    "-p", "spleeter:2stems",
-                    "-c", "mp3",
-                    "-o", str(spleeter_out),
-                    str(actual_input),
-                ],
-                capture_output=True, text=True, timeout=spleeter_timeout,
-            )
-            elapsed = time.time() - t0
+            # Collect lrclib result (almost certainly done by now)
+            lrclib_result: dict | None = None
+            if lrclib_task:
+                lrclib_result = await lrclib_task
+                if lrclib_result:
+                    logging.info("[%s] lrclib hit: %s — %s", job_id, lrclib_result.get("lyrics_artist"), lrclib_result.get("lyrics_matched"))
+                    _jobs[job_id].update(lrclib_result)
+                else:
+                    logging.info("[%s] lrclib miss — Whisper will transcribe", job_id)
 
-            if sep.returncode != 0:
-                combined = ((sep.stderr or "") + (sep.stdout or ""))
-                combined = combined.replace(str(WORK_DIR), "[workdir]")
-                logging.error(
-                    "[%s] Spleeter failed after %.1fs (returncode=%s): %r",
-                    job_id, elapsed, sep.returncode, combined[-500:],
-                )
-                _jobs[job_id] = {"status": "error", "error": f"Vocal separation failed: {combined[-500:]}"}
-                return
-
-            logging.info("[%s] Vocal separation complete in %.1fs", job_id, elapsed)
-
-            # Step 3: Find output
-            accompaniment = spleeter_out / actual_input.stem / "accompaniment.mp3"
-            if not accompaniment.exists():
-                _jobs[job_id] = {"status": "error", "error": "Output file not found."}
-                return
-
+            # ------------------------------------------------------------------
+            # Step 2: Demucs separation
+            #   Loads model, separates, then explicitly frees RAM before
+            #   Whisper runs — they never coexist in memory
+            # ------------------------------------------------------------------
+            demucs_timeout = int(max(180, min(song_duration * 4, 700))) if song_duration else 700
             serve_name = f"{job_id}_karaoke.mp3"
-            shutil.copy2(accompaniment, WORK_DIR / serve_name)
+            output_path = WORK_DIR / serve_name
+
+            logging.info("[%s] Starting Demucs separation (timeout: %ds)...", job_id, demucs_timeout)
+            _jobs[job_id]["step"] = "separating"
+
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(_run_demucs_separation, actual_input, output_path),
+                    timeout=demucs_timeout,
+                )
+            except asyncio.TimeoutError:
+                logging.error("[%s] Demucs timed out", job_id)
+                _jobs[job_id].update({"status": "error", "error": "Processing timed out. Try a shorter song."})
+                return
+            except Exception as e:
+                logging.error("[%s] Demucs failed: %s", job_id, e)
+                _jobs[job_id].update({"status": "error", "error": f"Vocal separation failed: {e}"})
+                return
+
+            if not output_path.exists():
+                _jobs[job_id].update({"status": "error", "error": "Output file not found."})
+                return
+
+            logging.info("[%s] Separation complete", job_id)
+
+            # ------------------------------------------------------------------
+            # Step 3: Whisper transcription (sequential — Demucs RAM is free)
+            #   Only runs when lrclib found nothing
+            # ------------------------------------------------------------------
+            if not lrclib_result and _whisper_model is not None:
+                logging.info("[%s] Starting Whisper transcription...", job_id)
+                _jobs[job_id]["step"] = "transcribing"
+                whisper_result = await asyncio.to_thread(_run_whisper, actual_input)
+                if whisper_result:
+                    logging.info("[%s] Whisper lyrics stored", job_id)
+                    _jobs[job_id].update(whisper_result)
+
             logging.info("[%s] Job complete. Serving: %s", job_id, serve_name)
             _jobs[job_id].update({"status": "complete", "audio_url": f"/api/audio/{serve_name}"})
 
@@ -273,15 +442,6 @@ async def serve_audio(filename: str):
     )
 
 
-def _clean_title_for_search(title: str) -> str:
-    """Strip common YouTube noise before sending to lyrics search."""
-    # Remove parenthetical/bracketed suffixes like (Official Video), [4K], (Remastered 2011)
-    title = re.sub(r"[\(\[][^\)\]]{0,40}[\)\]]", "", title)
-    # Remove common filler words that hurt search
-    title = re.sub(r"\b(official|video|audio|lyrics|lyric|hd|hq|mv|ft\.?|feat\.?)\b", "", title, flags=re.IGNORECASE)
-    return title.strip(" -–|")
-
-
 @app.get("/api/lyrics/{job_id}")
 async def get_lyrics(job_id: str):
     if not re.fullmatch(r"[a-f0-9]{8}", job_id):
@@ -289,40 +449,14 @@ async def get_lyrics(job_id: str):
     job = _jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    title = job.get("title")
-    if not title:
-        return JSONResponse({"lyrics": None, "title": None})
-
-    query = _clean_title_for_search(title)
-    logging.info("[%s] Fetching lyrics for: %s", job_id, query)
-
-    try:
-        encoded = urllib.parse.urlencode({"q": query})
-        req = urllib.request.Request(
-            f"https://lrclib.net/api/search?{encoded}",
-            headers={"User-Agent": "karaoke-maker/1.0"},
-        )
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            results = json.loads(resp.read().decode())
-
-        if not results:
-            return JSONResponse({"lyrics": None, "title": title})
-
-        # Prefer results that have plain lyrics; take the first match
-        best = next((r for r in results if r.get("plainLyrics")), None)
-        if not best:
-            return JSONResponse({"lyrics": None, "title": title})
-
-        return JSONResponse({
-            "lyrics": best["plainLyrics"],
-            "title": title,
-            "matched": best.get("trackName") or best.get("title"),
-            "artist": best.get("artistName"),
-        })
-
-    except Exception as e:
-        logging.warning("[%s] Lyrics fetch failed: %s", job_id, e)
-        return JSONResponse({"lyrics": None, "title": title})
+    return JSONResponse({
+        "lyrics": job.get("lyrics"),
+        "lyrics_synced": job.get("lyrics_synced", False),
+        "lyrics_source": job.get("lyrics_source"),
+        "title": job.get("title"),
+        "artist": job.get("lyrics_artist"),
+        "matched": job.get("lyrics_matched"),
+    })
 
 
 @app.get("/api/health")
@@ -331,7 +465,10 @@ async def health():
 
 
 @app.on_event("startup")
-async def _start_cleanup_task():
+async def _on_startup():
+    # Load Whisper in a background thread so it doesn't block server startup
+    asyncio.create_task(asyncio.to_thread(_load_whisper_model))
+
     async def _cleanup_loop():
         while True:
             await asyncio.sleep(300)
@@ -346,10 +483,10 @@ async def _start_cleanup_task():
                                 p.unlink(missing_ok=True)
                     except OSError:
                         pass
-                # Clean up old job records
                 for jid in list(_jobs.keys()):
                     if time.time() - _jobs[jid].get("started_at", time.time()) > 7200:
                         del _jobs[jid]
             except Exception:
                 pass
+
     asyncio.create_task(_cleanup_loop())
